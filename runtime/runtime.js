@@ -234,25 +234,36 @@
       return rel && rel.indexOf('__rpgm/') !== 0 ? rel : null;
     } catch (e) { return null; }
   }
-  var loads = { active: 0, count: 0, done: 0, bytes: 0, loaded: 0, since: 0, onChange: null, preload: null };
+  // count/bytes: downloads started in this burst; queued: preload files not started yet.
+  var loads = { active: 0, count: 0, done: 0, bytes: 0, loaded: 0, since: 0, onChange: null, preload: null, queued: 0, queuedBytes: 0 };
   function changed() { if (loads.onChange) loads.onChange(); }
   /** Start tracking one download; returns { progress(n), end() }. */
-  function startBatch() { if (!loads.active) { loads.count = loads.done = loads.bytes = loads.loaded = 0; loads.since = Date.now(); } }
+  function startBatch() {
+    if (loads.active || loads.queued) return;
+    loads.count = loads.done = loads.bytes = loads.loaded = 0; loads.since = Date.now();
+  }
   var pre = null; // preload: { pending: Map(lower path -> entry), inflight: Set }
-  function track(u, counted) {
+  /** Take a file off the preload queue (started by the preload, or wanted by the game). */
+  function unqueue(key) {
+    var e = pre.pending.get(key);
+    if (!e) return false;
+    pre.pending.delete(key);
+    loads.queued--; loads.queuedBytes -= e.size;
+    return true;
+  }
+  function track(u, fromPreload) {
     var rel = gamePath(u);
     if (rel === null) return null;
     var key = rel.toLowerCase();
-    if (pre && !counted) {
-      // The game wants a file the preload has queued or is fetching: one download, counted once.
+    if (pre && !fromPreload) {
+      // The game wants a file the preload is fetching or has queued: one download, counted once.
       if (pre.inflight.has(key)) return null;
-      if (pre.pending.has(key)) { pre.pending.delete(key); loads.preload.done++; counted = true; }
+      if (unqueue(key)) loads.preload.done++;
     }
     var entry = manifest.get(key);
     var size = entry ? entry.size : 0;
     startBatch();
-    loads.active++;
-    if (!counted) { loads.count++; loads.bytes += size; } // the preload adds its whole queue up front
+    loads.active++; loads.count++; loads.bytes += size;
     var got = 0, ended = false;
     changed();
     return {
@@ -319,7 +330,7 @@
     var total = queue.reduce(function (a, e) { return a + e.size; }, 0);
     loads.preload = { files: queue.length, bytes: total, done: 0 };
     startBatch();
-    loads.count += queue.length; loads.bytes += total;
+    loads.queued = queue.length; loads.queuedBytes = total;
     log('preloading', queue.length, 'files', total);
     pre = { pending: new Map(queue.map(function (e) { return [e.path.toLowerCase(), e]; })), inflight: new Set() };
     var url = function (p) { return BASE_PATH + p.split('/').map(encodeURIComponent).join('/'); };
@@ -328,7 +339,7 @@
       while ((e = queue.shift()) && !pre.pending.has(e.path.toLowerCase())) { /* the game took it */ }
       if (!e) return Promise.resolve();
       var key = e.path.toLowerCase();
-      pre.pending.delete(key); pre.inflight.add(key);
+      unqueue(key); pre.inflight.add(key);
       var t = track(url(e.path), true);
       return loads.fetch.call(window, url(e.path), { priority: 'low' }).then(function (r) {
         if (!r.body || !r.body.getReader) return r.arrayBuffer();
@@ -1484,12 +1495,13 @@
     var mb = function (n) { return n >= 10485760 ? Math.round(n / 1048576) : (n / 1048576).toFixed(1); };
     var ldTimer = null, ldHide = null;
     var renderLoads = function () {
-      var busy = loads.active > 0;
-      var big = loads.bytes > 1048576 || loads.count > 10;
+      var busy = loads.active > 0 || loads.queued > 0;
+      var count = loads.count + loads.queued, bytes = loads.bytes + loads.queuedBytes;
+      var big = bytes > 1048576 || count > 10;
       if (busy && big && Date.now() - loads.since > 800) {
         clearTimeout(ldHide); ldHide = null;
-        var pct = loads.bytes ? Math.min(100, loads.loaded / loads.bytes * 100) : loads.done / loads.count * 100;
-        ldText.textContent = 'Loading ' + loads.done + ' / ' + loads.count + (loads.bytes ? ' \u00b7 ' + mb(loads.loaded) + ' / ' + mb(loads.bytes) + ' MB' : '');
+        var pct = bytes ? Math.min(100, loads.loaded / bytes * 100) : loads.done / count * 100;
+        ldText.textContent = 'Loading ' + loads.done + ' / ' + count + (bytes ? ' \u00b7 ' + mb(loads.loaded) + ' / ' + mb(bytes) + ' MB' : '');
         ldBar.style.width = pct.toFixed(1) + '%';
         ld.classList.add('on');
       } else if (!busy && ld.classList.contains('on') && !ldHide) {
