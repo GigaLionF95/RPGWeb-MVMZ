@@ -782,6 +782,14 @@ export async function startServer(config, lib) {
   }
 
   /** /play/<id>/: our host page, which keeps saves and frames the sandboxed game. */
+  const escHtml = (v) => String(v).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  /** <title> and the game's icon as the tab icon (also for "add to home screen"). */
+  function pageHead(meta) {
+    const icon = meta.icon ? `../../api/games/${meta.id}/icon?v=${meta.rev}` : null;
+    return `<title>${escHtml(meta.title)}</title>` +
+      (icon ? `\n<link rel="icon" href="${icon}">\n<link rel="apple-touch-icon" href="${icon}">` : '');
+  }
+
   async function servePlayHost(req, res, id, g) {
     const { meta } = g;
     const cfg = {
@@ -794,7 +802,7 @@ export async function startServer(config, lib) {
     };
     return sendFile(req, res, path.join(WEB_DIR, 'play.html'), {
       type: 'text/html; charset=utf-8', cacheControl: 'no-cache',
-      transform: (buf) => Buffer.from(buf.toString('utf8').replace('/*RPGM_PLAY*/null', JSON.stringify(cfg).replace(/</g, '\\u003c'))),
+      transform: (buf) => Buffer.from(buf.toString('utf8').replace('<title>Play</title>', () => pageHead(meta)).replace('/*RPGM_PLAY*/null', JSON.stringify(cfg).replace(/</g, '\\u003c'))),
       cacheKey: `play|${id}|${g.mtime}|${runtimeVersion}`, etagSeed: `h${Math.floor(g.mtime).toString(36)}-${runtimeVersion}-`,
     });
   }
@@ -812,7 +820,7 @@ export async function startServer(config, lib) {
     };
     return sendFile(req, res, path.join(WEB_DIR, 'embed.html'), {
       type: 'text/html; charset=utf-8', cacheControl: 'no-cache',
-      transform: (buf) => Buffer.from(buf.toString('utf8').replace('/*RPGM_EMBED*/null', JSON.stringify(cfg).replace(/</g, '\\u003c'))),
+      transform: (buf) => Buffer.from(buf.toString('utf8').replace('<title>Play</title>', () => pageHead(g.meta)).replace('/*RPGM_EMBED*/null', JSON.stringify(cfg).replace(/</g, '\\u003c'))),
       cacheKey: `embed|${id}|${g.mtime}`, etagSeed: `e${Math.floor(g.mtime).toString(36)}-`,
     });
   }

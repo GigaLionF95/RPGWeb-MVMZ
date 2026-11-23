@@ -123,3 +123,22 @@ test('Live2D preload: on by default for Live2D games, per-game switch, page reva
     assert.match(await r.text(), /"preload":null/);
   } finally { s.close(); }
 });
+
+test('the play and embed pages use the game icon as the tab icon, with the game title', async () => {
+  const work = await tmpdir();
+  const lib = new Library(path.join(work, 'd'));
+  await importGame(lib, await makeGame(path.join(work, 'g'), 'mv', { title: 'Tom & <Jerry>' }), { id: 'fav', transcode: 'off' });
+  const s = await startServer({ dataDir: lib.dataDir, port: 0, host: '127.0.0.1', adminToken: 't', publicLibrary: true, maxUploadBytes: 1 << 20 }, lib);
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    for (const page of ['play', 'embed']) {
+      const html = await (await fetch(`${base}/${page}/fav/`)).text();
+      assert.match(html, /<title>Tom &#38; &#60;Jerry&#62;<\/title>/, page);
+      assert.match(html, /<link rel="icon" href="\.\.\/\.\.\/api\/games\/fav\/icon\?v=1">/, page);
+      assert.match(html, /<link rel="apple-touch-icon" href="\.\.\/\.\.\/api\/games\/fav\/icon\?v=1">/, page);
+    }
+    const icon = await fetch(new URL('../../api/games/fav/icon?v=1', `${base}/play/fav/`));
+    assert.equal(icon.status, 200);
+    assert.match(icon.headers.get('content-type'), /^image\//);
+  } finally { s.close(); }
+});
