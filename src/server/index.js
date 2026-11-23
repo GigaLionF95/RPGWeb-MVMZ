@@ -709,19 +709,26 @@ export async function startServer(config, lib) {
     }
 
     if (parts[0] === 'uploads') return handleChunked(req, res, url, parts);
+    // The admin must see their own changes at once: on a replica, admin reads of
+    // the library come from the primary (writes went there; the copy here
+    // catches up within the sync interval).
+    if (isReplica && isAdmin(req) && parts[0] === 'games' && parts.length <= 2 && (method === 'GET' || method === 'HEAD')) {
+      return proxyToPrimary(req, res, url);
+    }
     if (parts[0] === 'auth' && method === 'GET') return sendJson(res, isAdmin(req) ? 200 : 401, { admin: isAdmin(req) });
     if (parts[0] === 'games' && parts.length === 1) {
       if (method === 'GET') {
         const admin = isAdmin(req);
         if ((!config.publicLibrary || config.apiOnly) && !admin) throw new HttpError(401, 'admin token required');
-        const games = (await lib.list()).filter((g) => admin || !g.hidden).map(publicMeta);
+        // Other worker processes cache meta.json for a second: the admin reads it fresh.
+        const games = (await lib.list({ fresh: admin })).filter((g) => admin || !g.hidden).map(publicMeta);
         return sendJson(res, 200, { games, admin });
       }
       if (method === 'POST' || method === 'PUT') return handleUpload(req, res, url);
     }
     if (parts[0] === 'games' && parts[1]) {
       const id = parts[1];
-      const g = await lib.get(id);
+      const g = await lib.get(id, { fresh: isAdmin(req) });
       if (!g) throw new HttpError(404, 'game not found');
       // Images come from the game: never let one run as a document here.
       if (parts[2] === 'icon' || parts[2] === 'cover') res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'");

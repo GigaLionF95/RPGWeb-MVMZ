@@ -30,11 +30,12 @@ export class Library {
   gameDir(id) { return path.join(this.gamesDir, id); }
   rootDir(id) { return path.join(this.gamesDir, id, 'game'); }
 
-  async list() {
+  /** @param {{fresh?: boolean}} [opts] fresh: re-check meta.json now (admin views). */
+  async list(opts = {}) {
     const out = [];
     for (const e of await fsp.readdir(this.gamesDir, { withFileTypes: true })) {
       if (!e.isDirectory() || !ID_RE.test(e.name)) continue;
-      const g = await this.get(e.name);
+      const g = await this.get(e.name, opts);
       if (g) out.push(g.meta);
     }
     out.sort((a, b) => (b.importedAt || '').localeCompare(a.importedAt || ''));
@@ -42,14 +43,14 @@ export class Library {
   }
 
   /** Cached { meta, files, lower } for a game; reloads when meta.json changes. */
-  async get(id) {
+  async get(id, { fresh = false } = {}) {
     if (!ID_RE.test(id)) return null;
     // Hot path (every game file request): trust the cache for a second
     // before checking meta.json again. Changes made by this process clear
     // the cache at once; other processes (CLI, workers, sync) show up within 1 s.
     const c = this._cache.get(id);
     const now = Date.now();
-    if (c && now - c.checkedAt < 1000) return c;
+    if (c && !fresh && now - c.checkedAt < 1000) return c;
     const metaFile = path.join(this.gameDir(id), 'meta.json');
     let st;
     try { st = await fsp.stat(metaFile); } catch { this._cache.delete(id); return null; }

@@ -129,6 +129,12 @@ function renderGames(games) {
   }
 }
 
+/** Show the server's reply for one game at once (null: it was deleted), before the list reloads. */
+function applyGame(id, g) {
+  const list = [...byId.values()].map((x) => (x.id === id ? g : x)).filter(Boolean);
+  renderGames(list);
+}
+
 async function refresh() {
   try {
     const { games, admin: isAdmin } = await api('games');
@@ -302,7 +308,7 @@ $('#games').addEventListener('click', async (e) => {
   try {
     if (act === 'delete') { li.querySelector('.confirm').hidden = false; li.querySelector('[data-act=cancel-delete]').focus(); }
     else if (act === 'cancel-delete') li.querySelector('.confirm').hidden = true;
-    else if (act === 'confirm-delete') { btn.disabled = true; await api(`games/${id}`, { method: 'DELETE' }); await refresh(); setStatus('Game deleted.'); }
+    else if (act === 'confirm-delete') { btn.disabled = true; await api(`games/${id}`, { method: 'DELETE' }); applyGame(id, null); setStatus('Game deleted.'); await refresh(); }
     else if (act === 'embed' || act === 'cover') {
       const panel = li.querySelector('.embed');
       panel.hidden = act === 'cover' ? false : !panel.hidden;
@@ -314,11 +320,11 @@ $('#games').addEventListener('click', async (e) => {
       setTimeout(() => { btn.querySelector('span').textContent = 'Copy code'; }, 1600);
     } else if (act === 'pick-cover') li.querySelector('.cover-file').click();
     else if (act === 'remove-cover') {
-      await api(`games/${id}/cover`, { method: 'DELETE' });
+      applyGame(id, await api(`games/${id}/cover`, { method: 'DELETE' })); reopenEmbed(id);
       await refresh(); reopenEmbed(id);
     } else if (act === 'hide') {
       const hidden = !li.classList.contains('hidden-game');
-      await api(`games/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hidden }) });
+      applyGame(id, await api(`games/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hidden }) }));
       await refresh();
     } else if (act === 'rename') startRename(li, id);
   } catch (err) { setStatus(err.message); }
@@ -328,8 +334,10 @@ $('#games').addEventListener('change', async (e) => {
   if (!e.target.classList.contains('preload-box')) return;
   const li = e.target.closest('.game');
   try {
-    await api(`games/${li.dataset.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ preload: e.target.checked }) });
-    await refresh(); reopenEmbed(li.dataset.id);
+    const gid = li.dataset.id;
+    applyGame(gid, await api(`games/${gid}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ preload: e.target.checked }) }));
+    reopenEmbed(gid);
+    await refresh(); reopenEmbed(gid);
   } catch (err) { setStatus(err.message); }
 });
 
@@ -357,9 +365,10 @@ $('#games').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   e.target.value = '';
   try {
-    await api(`games/${id}/cover`, { method: 'PUT', headers: { 'Content-Type': file.type }, body: file });
-    await refresh(); reopenEmbed(id);
+    applyGame(id, await api(`games/${id}/cover`, { method: 'PUT', headers: { 'Content-Type': file.type }, body: file }));
+    reopenEmbed(id);
     setStatus('Cover updated.');
+    await refresh(); reopenEmbed(id);
   } catch (err) { setStatus(`Could not set the cover: ${err.message}`); }
 });
 
@@ -375,7 +384,7 @@ function startRename(li, id) {
     t.removeEventListener('blur', onBlur);
     const title = t.textContent.trim();
     if (!save || !title || title === before) { t.textContent = before; return; }
-    try { await api(`games/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) }); await refresh(); }
+    try { applyGame(id, await api(`games/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) })); await refresh(); }
     catch (err) { t.textContent = before; setStatus(err.message); }
   };
   const onKey = (e) => { if (e.key === 'Enter') { e.preventDefault(); done(true); } if (e.key === 'Escape') done(false); };
