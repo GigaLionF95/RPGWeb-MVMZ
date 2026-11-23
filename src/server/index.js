@@ -13,7 +13,8 @@ import { importGame } from '../importer/index.js';
 import { ID_RE } from '../library.js';
 import { decrypt } from '../importer/rpgcrypt.js';
 import { compressAsync, patchId, PRE_DIR, PRE_EXT } from '../precompress.js';
-import { createSyncSource, Replica } from '../sync.js';
+import { createSyncSource, Replica, nodeIdentity, readView } from '../sync.js';
+import { Cluster, PRIMARY } from '../cluster.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const WEB_DIR = path.join(ROOT, 'web');
@@ -136,30 +137,44 @@ export async function startServer(config, lib) {
   const syncSource = createSyncSource(lib);
   // Replica mode: every worker forwards admin writes; only the leader worker syncs.
   const isReplica = !!config.upstream;
+  const log = (m) => console.log(m);
+  const nodeId = isReplica ? nodeIdentity(config.dataDir) : PRIMARY;
   const replica = config.upstream && leader
-    ? new Replica(lib, { upstream: config.upstream, token: config.adminToken, intervalMs: config.syncIntervalMs, log: (m) => console.log(m) })
+    ? new Replica(lib, { upstream: config.upstream, token: config.adminToken, nodeId, advertise: config.advertise, source: syncSource, intervalMs: config.syncIntervalMs, log })
     : null;
+  // Primary: every worker reads the pool state; the leader decides placement.
+  const cluster = isReplica ? null : new Cluster(lib, { source: syncSource, replicas: config.replicas, token: config.adminToken, nodeTimeoutMs: config.nodeTimeoutMs, log });
 
-  /** Ask the syncing worker to sync soon (it may be another process). */
+  /** Ask the leader worker to sync (replica) or re-plan (primary) soon; it may be another process. */
   const pokeSync = () => {
     if (replica) replica.poke();
-    else if (isReplica && process.send) process.send({ rpgm: 'sync-poke' });
+    else if (cluster && leader) cluster.tick();
+    else if (process.send) process.send({ rpgm: 'sync-poke' });
   };
-  if (replica && process.send) process.on('message', (m) => { if (m && m.rpgm === 'sync-poke') replica.poke(); });
+  if (leader && process.send) {
+    process.on('message', (m) => {
+      if (m?.rpgm !== 'sync-poke') return;
+      if (replica) replica.poke(); else cluster?.tick();
+    });
+  }
 
-  /** Replica: send an admin request on to the primary, streaming both ways. */
-  function proxyToPrimary(req, res, url, { inspect } = {}) {
-    const target = new URL(url.pathname + url.search, config.upstream + '/');
+  const HOP = ['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-connection'];
+  const agents = { 'http:': new http.Agent({ keepAlive: true, maxSockets: 256 }), 'https:': new https.Agent({ keepAlive: true, maxSockets: 256 }) };
+
+  /** Send a request on to another server, streaming both ways. */
+  function proxyTo(base, req, res, url, { inspect, headers: extra } = {}) {
+    const target = new URL(url.pathname + url.search, base + '/');
     const mod = target.protocol === 'https:' ? https : http;
-    const headers = { ...req.headers, host: target.host };
-    delete headers.connection;
+    const headers = { ...req.headers, host: target.host, ...extra };
+    for (const h of HOP) delete headers[h];
+    delete headers['x-rpgm-accel'];
     return new Promise((resolve) => {
-      const up = mod.request(target, { method: req.method, headers }, async (ur) => {
+      const up = mod.request(target, { method: req.method, headers, agent: agents[target.protocol] }, async (ur) => {
         if (!inspect) {
-          res.writeHead(ur.statusCode, ur.headers);
-          ur.pipe(res);
-          ur.on('end', resolve);
-          ur.on('error', resolve);
+          const h = { ...ur.headers };
+          for (const k of HOP) if (k !== 'transfer-encoding') delete h[k];
+          res.writeHead(ur.statusCode, h);
+          pipeline(ur, res).catch(() => {}).finally(resolve);
           return;
         }
         const chunks = [];
@@ -173,11 +188,75 @@ export async function startServer(config, lib) {
         resolve();
       });
       up.on('error', (e) => {
-        if (!res.headersSent) sendJson(res, 502, { error: `the primary server is unreachable (${e.message})` });
+        if (!res.headersSent) sendJson(res, 502, { error: `${base === config.upstream ? 'the primary server' : base} is unreachable (${e.message})` });
+        else res.destroy();
         resolve();
       });
       req.pipe(up);
     });
+  }
+  const proxyToPrimary = (req, res, url, opts) => proxyTo(config.upstream, req, res, url, opts);
+
+  // ---- games kept on other servers ------------------------------------------
+  let viewCache = { at: 0, value: null };
+  /** Base URLs of the other servers that have a game's current files. */
+  async function ownerUrls(id) {
+    if (cluster) {
+      const st = await cluster.state();
+      return cluster.owners(st, id).filter((n) => n !== PRIMARY).map((n) => st.nodes[n]?.url).filter(Boolean);
+    }
+    if (Date.now() - viewCache.at > 2000) viewCache = { at: Date.now(), value: await readView(lib) };
+    const v = viewCache.value;
+    return (v.owners[id] || []).filter((n) => n !== nodeId).map((n) => (n === PRIMARY ? config.upstream : v.nodes[n])).filter(Boolean);
+  }
+
+  /** nginx in front asked to send files itself (see "rpgm-web nginx-snippet"). */
+  const useAccel = (req) => config.accel !== false && req.headers['x-rpgm-accel'] === '1' && !req.headers['x-rpgm-forwarded'];
+
+  /** This server has the game's catalog but not its files: fetch from one that has them. */
+  async function forwardGame(req, res, id, url) {
+    if (req.headers['x-rpgm-forwarded']) throw new HttpError(404, 'the game files are not on this server');
+    const urls = await ownerUrls(id);
+    if (!urls.length) throw new HttpError(503, 'this game is being copied between servers, try again in a minute');
+    const base = urls[Math.floor(Math.random() * urls.length)];
+    const u = new URL(base);
+    if (useAccel(req) && u.protocol === 'http:' && u.pathname === '/') {
+      // nginx proxies it (location /__rpgm_node/); this process is done.
+      res.writeHead(200, { 'X-Accel-Redirect': `/__rpgm_node/${u.host}` });
+      return res.end();
+    }
+    return proxyTo(base, req, res, url, { headers: { 'x-rpgm-forwarded': '1' } });
+  }
+
+  /**
+   * Hand a plain game file to nginx (X-Accel-Redirect): the precompressed
+   * copy when the browser takes it, else the file itself. Returns false when
+   * this one needs the server (compressing on the fly, odd file names).
+   */
+  async function accelFile(req, res, id, hit, preFiles, cacheControl) {
+    if (/[?%#\\\x00-\x1f\x7f]/.test(hit)) return false;
+    const type = mimeOf(hit);
+    let target = `/__rpgm_files/${id}/game/${hit}`;
+    const enc = isCompressible(type) ? pickEncoding(req) : null;
+    if (enc) {
+      const e = preFiles[hit];
+      if (!e) {
+        // Not in the precompressed index: tiny files go as they are, others need us.
+        const st = await fsp.stat(path.join(lib.rootDir(id), hit)).catch(() => null);
+        if (!st) throw new HttpError(404, 'not found');
+        if (st.size > 1024) return false;
+      } else if (e[enc]) {
+        const st = await fsp.stat(path.join(lib.rootDir(id), hit)).catch(() => null);
+        if (!st) throw new HttpError(404, 'not found');
+        if (e.size !== st.size || e.mtime !== Math.floor(st.mtimeMs) || e.patch) return false;
+        target = `/__rpgm_files_${enc === 'br' ? 'br' : 'gz'}/${id}/${PRE_DIR}/${hit}${PRE_EXT[enc]}`;
+      }
+      // else: compressing didn't pay off at import, send the file as it is.
+    }
+    // UTF-8 bytes as they are (nginx does not decode this header).
+    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': cacheControl + ', no-transform', 'X-Accel-Redirect': Buffer.from(target, 'utf8').toString('latin1') });
+    res.end();
+    return true;
   }
   // Same on every worker and every server, changes only with the code the
   // browser gets, so ETags and the runtime URL stay stable behind a load balancer.
@@ -300,6 +379,7 @@ export async function startServer(config, lib) {
     const immutable = current ? 'public, max-age=31536000, immutable' : 'no-cache';
 
     if (rel === '' || rel.toLowerCase() === 'index.html') {
+      if (!g.local) return forwardGame(req, res, id, new URL(req.url, 'http://x'));
       const indexRel = resolveGamePath(g, 'index.html');
       const cfg = {
         id, engine: meta.engine, title: meta.title, rev: meta.rev,
@@ -341,8 +421,10 @@ export async function startServer(config, lib) {
     if (rel.split('/').some((s) => s === '..' || s === '.')) throw new HttpError(400, 'bad path');
     const hit = resolveGamePath(g, rel);
     if (!hit) throw new HttpError(404, 'not found');
+    if (!g.local) return forwardGame(req, res, id, new URL(req.url, 'http://x'));
     const hook = hookFor(hit);
     const preFiles = await preIndex(id, g);
+    if (!hook && useAccel(req) && await accelFile(req, res, id, hit, preFiles, immutable)) return;
     return sendFile(req, res, path.join(lib.rootDir(id), hit), {
       pre: preFiles[hit] ? { entry: preFiles[hit], file: path.join(lib.gameDir(id), PRE_DIR, hit), patch: patchId(hook) } : null,
       cacheControl: hook ? 'no-cache' : immutable,
@@ -453,15 +535,34 @@ export async function startServer(config, lib) {
     const parts = url.pathname.split('/').filter(Boolean).slice(1); // drop 'api'
     const method = req.method;
 
-    // Library sync for replicas (admin token).
+    // Servers in one pool talk to each other here (admin token).
+    if (parts[0] === 'sync' && parts[1] === 'heartbeat' && parts.length === 2 && method === 'POST') {
+      requireAdmin(req);
+      if (!cluster) throw new HttpError(409, 'this server is a replica; heartbeats go to the primary');
+      const body = await readJsonBody(req, 4 * 1024 * 1024);
+      let r;
+      try { r = await cluster.heartbeat(body); } catch (e) { throw new HttpError(400, e.message); }
+      if (!r.known) pokeSync(); // a new server: place games on it now
+      return sendJson(res, 200, { ok: true });
+    }
+    if (parts[0] === 'cluster' && parts.length === 1 && method === 'GET') {
+      requireAdmin(req);
+      if (cluster) return sendJson(res, 200, { role: 'primary', ...(await cluster.summary()) });
+      return sendJson(res, 200, { role: 'replica', node: nodeId, upstream: config.upstream, view: await readView(lib) });
+    }
     if (parts[0] === 'sync' && (method === 'GET' || method === 'HEAD')) {
       requireAdmin(req);
-      if (parts.length === 1) return sendJson(res, 200, await syncSource.list());
+      if (parts.length === 1) {
+        if (!cluster) throw new HttpError(409, 'this server is a replica');
+        return sendJson(res, 200, await cluster.plan(String(url.searchParams.get('node') || '')));
+      }
       const id = parts[1];
       if (parts.length === 2) {
         const e = await syncSource.game(id);
         if (!e) throw new HttpError(404, 'game not found');
-        return sendJson(res, 200, { id, stamp: e.stamp, files: e.files });
+        const part = url.searchParams.get('part') === 'catalog' ? 'catalog' : 'data';
+        if (part === 'data' && !e.data.length) throw new HttpError(404, 'the game files are not on this server');
+        return sendJson(res, 200, { id, part, stamp: part === 'data' ? e.dataStamp : e.catalogStamp, files: e[part] });
       }
       if (parts[2] === 'file' && parts.length === 3) {
         const file = await syncSource.file(id, url.searchParams.get('path'));
@@ -509,10 +610,14 @@ export async function startServer(config, lib) {
       if (parts[2] === 'icon' || parts[2] === 'cover') res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'");
       if (parts[2] === 'icon' && method === 'GET') {
         if (!g.meta.icon) throw new HttpError(404, 'no icon');
+        if (!g.local) return forwardGame(req, res, id, url);
         return sendFile(req, res, path.join(lib.rootDir(id), g.meta.icon), { cacheControl: 'public, max-age=3600' });
       }
       if (parts[2] === 'cover' && parts.length === 3) {
-        if (method === 'GET' || method === 'HEAD') return sendCover(req, res, g);
+        if (method === 'GET' || method === 'HEAD') {
+          if (!g.local && !g.meta.customCover) return forwardGame(req, res, id, url);
+          return sendCover(req, res, g);
+        }
         if (method === 'PUT' || method === 'POST') return handleCoverUpload(req, res, id);
         if (method === 'DELETE') { requireAdmin(req); await lib.removeCover(id, { updateMeta: true }); return sendJson(res, 200, publicMeta((await lib.get(id)).meta)); }
       }
@@ -611,7 +716,9 @@ export async function startServer(config, lib) {
           ok: true, version: PKG.version,
           role: isReplica ? 'replica' : 'primary',
           ...(isReplica ? { upstream: config.upstream } : {}),
-          ...(replica ? { sync: replica.state } : {}),
+          node: nodeId,
+          ...(replica ? { sync: { ...replica.state, mode: replica.mode } } : {}),
+          ...(cluster ? { replicas: config.replicas } : {}),
           ...(workers > 1 ? { worker: Number(process.env.RPGM_WORKER_ID || 0), workers } : {}),
         });
       }
@@ -658,6 +765,13 @@ export async function startServer(config, lib) {
 
   await new Promise((resolve) => server.listen(config.port, config.host, resolve));
   if (!leader) return server; // the leader prints the banner and runs the sync
+  if (cluster) {
+    const t = setInterval(() => cluster.tick(), 5000);
+    t.unref();
+    cluster.tick();
+    server.on('close', () => clearInterval(t));
+    server.cluster = cluster;
+  }
   if (replica) {
     console.log(`replica of ${config.upstream}: syncing every ${Math.round(config.syncIntervalMs / 1000)} s`);
     replica.start();

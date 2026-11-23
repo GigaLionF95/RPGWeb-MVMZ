@@ -53,12 +53,15 @@ export class Library {
     const metaFile = path.join(this.gameDir(id), 'meta.json');
     let st;
     try { st = await fsp.stat(metaFile); } catch { this._cache.delete(id); return null; }
-    if (c && c.mtime === st.mtimeMs) { c.checkedAt = now; return c; }
+    // `local`: the game files are on this server (with several servers some
+    // games may live elsewhere; see cluster.js).
+    const local = await fsp.access(this.rootDir(id)).then(() => true, () => false);
+    if (c && c.mtime === st.mtimeMs) { c.checkedAt = now; c.local = local; return c; }
     const meta = JSON.parse(await fsp.readFile(metaFile, 'utf8'));
     const files = JSON.parse(await fsp.readFile(path.join(this.gameDir(id), 'files.json'), 'utf8'));
     const lower = new Map();
     for (const [p] of files) if (!lower.has(p.toLowerCase())) lower.set(p.toLowerCase(), p);
-    const entry = { meta, files, lower, mtime: st.mtimeMs, checkedAt: now, fileSet: new Set(files.map(([p]) => p)) };
+    const entry = { meta, files, lower, local, mtime: st.mtimeMs, checkedAt: now, fileSet: new Set(files.map(([p]) => p)) };
     this._cache.set(id, entry);
     return entry;
   }

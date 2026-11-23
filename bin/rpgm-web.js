@@ -22,12 +22,15 @@ Usage:
                                     precompressed .br/.gz copies (--no-precompress to skip)
   rpgm-web cover  <id> <image.png|jpg|webp> | --remove
   rpgm-web token          print the admin API token
+  rpgm-web nginx-snippet [--root /path/to/data/games]
+                          nginx config that lets nginx send game files itself
 
 Environment: RPGM_DATA, RPGM_PORT, RPGM_HOST, RPGM_ADMIN_TOKEN, RPGM_FFMPEG,
              RPGM_PUBLIC_LIBRARY (1/0), RPGM_MAX_UPLOAD_GB, RPGM_MODE=api,
              RPGM_FRAME_ANCESTORS, RPGM_PRECOMPRESS (1/0), RPGM_MAX_UNPACKED_GB,
              RPGM_MAX_FILES, RPGM_IMPORT_CONCURRENCY, RPGM_WORKERS (auto|N), RPGM_UPSTREAM (replica of
-             this primary), RPGM_SYNC_INTERVAL (seconds)
+             this primary), RPGM_SYNC_INTERVAL (seconds), RPGM_REPLICAS (all|N),
+             RPGM_ADVERTISE_URL, RPGM_NODE_TIMEOUT (seconds), RPGM_ACCEL (1/0)
 `;
 
 const { values: opt, positionals } = parseArgs({
@@ -44,6 +47,7 @@ const { values: opt, positionals } = parseArgs({
     'api-only': { type: 'boolean' },
     remove: { type: 'boolean' },
     'no-precompress': { type: 'boolean' },
+    root: { type: 'string' },
   },
 });
 
@@ -158,6 +162,11 @@ try {
       const ext = path.extname(args[1]).slice(1).toLowerCase().replace('jpeg', 'jpg');
       await lib.setCover(id, fs.readFileSync(args[1]), ext);
       console.log(`cover set for ${id}`);
+      break;
+    }
+    case 'nginx-snippet': {
+      const { nginxSnippet } = await import('../src/nginx.js');
+      process.stdout.write(nginxSnippet(config, { root: opt.root || lib.gamesDir }));
       break;
     }
     case 'token':

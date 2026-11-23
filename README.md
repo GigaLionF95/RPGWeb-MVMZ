@@ -268,33 +268,53 @@ curl -H "Authorization: Bearer $TOKEN" --data-binary @game.zip \
 | `RPGM_WORKERS` | `auto` | server processes: one per CPU core (max 8), or a number |
 | `RPGM_UPSTREAM` | — | makes this server a replica of that primary (see [Several servers](#several-servers)) |
 | `RPGM_SYNC_INTERVAL` | `60` | replica: seconds between checks for changes on the primary |
+| `RPGM_REPLICAS` | `all` | primary: on how many servers each game is kept: `all`, or a number (see [Several servers](#several-servers)) |
+| `RPGM_ADVERTISE_URL` | — | replica: the address other servers of the pool use to reach this one |
+| `RPGM_NODE_TIMEOUT` | `180` | primary: seconds without contact before a server's games are placed elsewhere |
+| `RPGM_ACCEL` | `1` | `0`: ignore nginx's `X-Rpgm-Accel` and always send files from Node (see [nginx sends the files](#nginx-sends-the-files)) |
 | `RPGM_PRECOMPRESS` | `1` | `0`: skip making `.br`/`.gz` copies at import (compress on the fly only) |
 
 ## Several servers
 
 One server is usually enough: game files are cached by the browser and by a CDN, and the server mostly streams static files. Add servers when one machine runs out of bandwidth or disk, or for redundancy. You do not copy anything by hand:
 
-- **One primary** keeps the library. It is an ordinary rpgm-web server.
-- **Replicas** mirror it. Each replica checks the primary every minute and downloads new or changed games: only the files that differ. Games deleted on the primary are deleted on the replicas.
-- **Admin actions work on any server.** A replica forwards uploads, renames, cover changes and deletions to the primary. An upload made through a replica is already on that replica when the admin page says *Done*, and on the other replicas within a minute.
-- **Players can land on any server.** Saves live in the player's browser, so no sticky sessions are needed. Every node sends identical files with identical `ETag`s.
+- **One primary** keeps the library: game list, titles, covers. It is an ordinary rpgm-web server.
+- **Replicas** join it. Each replica checks the primary every minute, copies the game list and the game files placed on it (only the files that differ), and drops what is no longer placed there. Games deleted on the primary are deleted everywhere.
+- **Admin actions work on any server.** A replica forwards uploads, renames, cover changes and deletions to the primary. An upload made through a replica is in that replica's list when the admin page says *Done*.
+- **Players can land on any server.** Every server lists every game and plays every game. A server that doesn't keep a game's files fetches them from a server that does. Saves live in the player's browser, so no sticky sessions are needed. Every server sends identical files with identical `ETag`s.
 
-Set up a replica: a fresh rpgm-web install with **the same admin token** as the primary, plus the primary's address:
+### How many copies of each game (`RPGM_REPLICAS`, on the primary)
+
+| `RPGM_REPLICAS` | Each game is kept on | Disk needed | If a server goes down |
+|---|---|---|---|
+| `all` (default) | every server | every server holds the whole library | nothing changes, the others have everything |
+| `2` (or any number) | that many servers | library × 2, spread over the pool | its games are copied from the remaining copy to another server |
+| `1` | one server | library × 1, spread over the pool | its games are unavailable until it comes back |
+
+The primary counts as a server of the pool too. New games go to the servers with the most free disk space, and the biggest games are placed first. A game stays where it is placed: adding a server does not move existing games, it gets the next ones. Games are imported on the primary first. When the primary is not one of the places a game is assigned to, it deletes its own copy once those servers have the game. The game is never left with zero copies. A server is considered gone after `RPGM_NODE_TIMEOUT` seconds without contact (default 180). Its games are then placed on other servers, as long as some server still has them.
+
+With `RPGM_REPLICAS` other than `all`, servers fetch games from each other, so each replica must say how the others reach it: `RPGM_ADVERTISE_URL=http://10.0.0.2:8080` (a private address; IP addresses if you use the nginx offload below). Keep these ports closed to the public internet; only the servers of the pool need them.
+
+`GET /api/cluster` (admin token, on the primary) lists the servers with their free space and number of games, plus where each game is placed. `/healthz` shows each server's role and last sync: `{"role":"replica","sync":{"lastSync":"…","lastError":null,"games":12,"local":5,"mode":2}}`. Point your load balancer's health check at it.
+
+### Adding a replica
+
+A fresh rpgm-web install with **the same admin token** as the primary, plus the primary's address:
 
 ```bash
 RPGM_ADMIN_TOKEN=<the primary's token> RPGM_UPSTREAM=http://10.0.0.1:8080 node bin/rpgm-web.js serve
 ```
 
-With Docker, put both lines in the replica's `.env` file:
+With Docker, put the lines in the replica's `.env` file:
 
 ```
 RPGM_ADMIN_TOKEN=<the primary's token>
 RPGM_UPSTREAM=http://10.0.0.1:8080
+# only when the primary has RPGM_REPLICAS set to a number:
+RPGM_ADVERTISE_URL=http://10.0.0.2:8080
 ```
 
 and run `docker compose up -d`. Use the primary's direct or private address when you can, not a Cloudflare-proxied hostname. Cloudflare limits request bodies to 100 MB, and uploads forwarded by a replica would hit that limit. Import from the command line on the primary only: a replica refuses CLI imports, because the next sync would remove them.
-
-`/healthz` shows each node's role and the replica's last sync: `{"role":"replica","sync":{"lastSync":"…","lastError":null,"games":12}}`. Point your load balancer's health check at it.
 
 **Spreading players over the servers.** Pick one:
 
@@ -409,6 +429,41 @@ location /play/ {
     add_header X-Cache $upstream_cache_status;
 }
 ```
+
+### nginx sends the files
+
+By default Node streams every game file. With nginx in front you can hand that job to nginx: rpgm-web still decides what to send (the right revision, the precompressed `.br`/`.gz` copy, the headers), then answers with an `X-Accel-Redirect` and nginx sends the file from disk with `sendfile`. Node only handles the small requests and the patched engine scripts.
+
+```bash
+node bin/rpgm-web.js nginx-snippet > /etc/nginx/snippets/rpgm-files.conf
+# Docker: run it in the container and give nginx's path to the data folder
+docker compose exec rpgm-web node bin/rpgm-web.js nginx-snippet --root /opt/rpgm-web/data/games > /etc/nginx/snippets/rpgm-files.conf
+```
+
+```nginx
+server {
+    server_name games.example.com;
+    client_max_body_size 8g;
+    include snippets/rpgm-files.conf;          # internal locations, nginx-only
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Rpgm-Accel 1;       # "nginx can send the files"
+        proxy_request_buffering off;
+        proxy_read_timeout 1h;
+    }
+}
+```
+
+nginx needs read access to the data folder. With Docker, mount a folder instead of the named volume. Create it first with `mkdir -p data && sudo chown 1000:1000 data`, then add a `docker-compose.override.yml`:
+
+```yaml
+services:
+  rpgm-web:
+    volumes: [ "./data:/data" ]
+```
+
+Without the `X-Rpgm-Accel` header (no nginx, or nginx without the snippet) the server sends files itself as before, so the switch is safe to flip either way. Regenerate the snippet after changing `RPGM_FRAME_ANCESTORS` or `RPGM_GAME_SANDBOX`: nginx adds the security headers itself on these responses. The snippet also contains the location nginx uses to fetch a game from another server of the pool (`RPGM_REPLICAS`), so those bytes do not pass through Node either.
 
 ## Caching and compression
 

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
+import { parseReplicas } from './cluster.js';
 
 /** Merge CLI flags, env and <data>/config.json; create an admin token on first run. */
 export function loadConfig(flags = {}) {
@@ -41,6 +42,15 @@ export function loadConfig(flags = {}) {
     // Replica mode: mirror the library of this primary server and forward
     // admin writes to it (same admin token on every node).
     upstream: (process.env.RPGM_UPSTREAM || saved.upstream || '').replace(/\/+$/, '') || null,
+    // Primary: how many servers keep each game ('all' or a number), see cluster.js.
+    replicas: parseReplicas(process.env.RPGM_REPLICAS ?? saved.replicas ?? 'all'),
+    nodeTimeoutMs: Math.max(30, Number(process.env.RPGM_NODE_TIMEOUT || saved.nodeTimeout || 180)) * 1000,
+    // Replica: the address other servers use to reach this one (needed when
+    // RPGM_REPLICAS is not 'all', so games kept elsewhere can be fetched).
+    advertise: (process.env.RPGM_ADVERTISE_URL || saved.advertiseUrl || '').replace(/\/+$/, '') || null,
+    // Let nginx send game files (X-Accel-Redirect) when it asks for it with
+    // the X-Rpgm-Accel header; see "rpgm-web nginx-snippet".
+    accel: bool(process.env.RPGM_ACCEL, saved.accel ?? true),
     syncIntervalMs: Math.max(5, Number(process.env.RPGM_SYNC_INTERVAL || saved.syncInterval || 60)) * 1000,
     // Server processes: 'auto' = one per CPU core (max 8), or a number.
     workers: (() => {
