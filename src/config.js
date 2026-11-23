@@ -37,6 +37,10 @@ export function loadConfig(flags = {}) {
     },
     // Imports run one at a time by default so they never starve game serving.
     importConcurrency: Math.max(1, Number(process.env.RPGM_IMPORT_CONCURRENCY || saved.importConcurrency || 1)),
+    // Replica mode: mirror the library of this primary server and forward
+    // admin writes to it (same admin token on every node).
+    upstream: (process.env.RPGM_UPSTREAM || saved.upstream || '').replace(/\/+$/, '') || null,
+    syncIntervalMs: Math.max(5, Number(process.env.RPGM_SYNC_INTERVAL || saved.syncInterval || 60)) * 1000,
     // Brotli/gzip copies of text files made at import (served with zero CPU).
     precompress: bool(process.env.RPGM_PRECOMPRESS, saved.precompress ?? true),
   };

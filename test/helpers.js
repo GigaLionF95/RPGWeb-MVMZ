@@ -45,15 +45,17 @@ export function buildZip(entries, { prefix = Buffer.alloc(0) } = {}) {
   let offset = 0;
   for (const [name, body] of Object.entries(entries)) {
     const data = Buffer.from(body);
-    const comp = zlib.deflateRawSync(data);
+    // Real archivers store empty files (method 0, no data).
+    const method = data.length ? 8 : 0;
+    const comp = method ? zlib.deflateRawSync(data) : Buffer.alloc(0);
     const nameBuf = Buffer.from(name, 'utf8');
     const crc = crc32(data);
     const lh = Buffer.alloc(30);
-    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0x800, 6); lh.writeUInt16LE(8, 8);
+    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0x800, 6); lh.writeUInt16LE(method, 8);
     lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(comp.length, 18); lh.writeUInt32LE(data.length, 22); lh.writeUInt16LE(nameBuf.length, 26);
     locals.push(lh, nameBuf, comp);
     const ch = Buffer.alloc(46);
-    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(0x800, 8); ch.writeUInt16LE(8, 10);
+    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(0x800, 8); ch.writeUInt16LE(method, 10);
     ch.writeUInt32LE(crc, 16); ch.writeUInt32LE(comp.length, 20); ch.writeUInt32LE(data.length, 24); ch.writeUInt16LE(nameBuf.length, 28);
     ch.writeUInt32LE(offset, 42);
     centrals.push(ch, nameBuf);

@@ -24,9 +24,12 @@ MV/MZ games are HTML5 apps wrapped in NW.js (Chromium + Node). rpgm-web drops th
 
 The importer understands:
 - plain folders and archives (`.zip` including zip64, `.tar(.gz)`; `.7z` and `.rar` through bsdtar);
+- builds for every platform RPG Maker exports to: **Windows** (`Game.exe`), **Linux**, **macOS** (`Game.app/Contents/Resources/app.nw`) and **Android** (`.apk`, game in `assets/www/`);
 - MV desktop builds with `www/`;
 - NW.js `package.nw` or a zip appended to the `.exe`;
 - **Dragonhouse/Halva** packaging (`GameConfig.sbcf` + `*.halva2`).
+
+Desktop builds ship the NW.js runtime next to the game (`nw.dll`, `Game.exe`, `lib/libnw.so`, `locales/*.pak`…, 200–300 MB). A browser never uses it, so the importer leaves it out.
 
 ## Installation
 
@@ -262,7 +265,58 @@ curl -H "Authorization: Bearer $TOKEN" --data-binary @game.zip \
 | `RPGM_MAX_FILES` | `200000` | maximum number of files in an archive |
 | `RPGM_IMPORT_CONCURRENCY` | `1` | imports running at once; the rest wait in a queue |
 | `RPGM_GAME_SANDBOX` | `1` | `0`: run games without the opaque-origin sandbox (debugging only, see Security) |
+| `RPGM_UPSTREAM` | — | makes this server a replica of that primary (see [Several servers](#several-servers)) |
+| `RPGM_SYNC_INTERVAL` | `60` | replica: seconds between checks for changes on the primary |
 | `RPGM_PRECOMPRESS` | `1` | `0`: skip making `.br`/`.gz` copies at import (compress on the fly only) |
+
+## Several servers
+
+One server is usually enough: game files are cached by the browser and by a CDN, and the server mostly streams static files. Add servers when one machine runs out of bandwidth or disk, or for redundancy. You do not copy anything by hand:
+
+- **One primary** keeps the library. It is an ordinary rpgm-web server.
+- **Replicas** mirror it. Each replica checks the primary every minute and downloads new or changed games: only the files that differ. Games deleted on the primary are deleted on the replicas.
+- **Admin actions work on any server.** A replica forwards uploads, renames, cover changes and deletions to the primary. An upload made through a replica is already on that replica when the admin page says *Done*, and on the other replicas within a minute.
+- **Players can land on any server.** Saves live in the player's browser, so no sticky sessions are needed. Every node sends identical files with identical `ETag`s.
+
+Set up a replica: a fresh rpgm-web install with **the same admin token** as the primary, plus the primary's address:
+
+```bash
+RPGM_ADMIN_TOKEN=<the primary's token> RPGM_UPSTREAM=http://10.0.0.1:8080 node bin/rpgm-web.js serve
+```
+
+With Docker, put both lines in the replica's `.env` file:
+
+```
+RPGM_ADMIN_TOKEN=<the primary's token>
+RPGM_UPSTREAM=http://10.0.0.1:8080
+```
+
+and run `docker compose up -d`. Use the primary's direct or private address when you can, not a Cloudflare-proxied hostname. Cloudflare limits request bodies to 100 MB, and uploads forwarded by a replica would hit that limit. Import from the command line on the primary only: a replica refuses CLI imports, because the next sync would remove them.
+
+`/healthz` shows each node's role and the replica's last sync: `{"role":"replica","sync":{"lastSync":"…","lastError":null,"games":12}}`. Point your load balancer's health check at it.
+
+**Spreading players over the servers.** Pick one:
+
+- **Cloudflare, free:** add several proxied `A` records with the same name, one per server. Cloudflare spreads visitors between them. Use Cloudflare Load Balancing (paid) if you also want health checks and automatic failover.
+- **nginx in front:**
+
+  ```nginx
+  upstream rpgm {
+      server 10.0.0.1:8080;            # primary
+      server 10.0.0.2:8080;            # replica
+      server 10.0.0.3:8080;            # replica
+  }
+  server {
+      server_name games.example.com;
+      client_max_body_size 8g;
+      location / {
+          proxy_pass http://rpgm;
+          proxy_request_buffering off;
+          proxy_read_timeout 1h;
+          proxy_set_header Host $host;
+      }
+  }
+  ```
 
 ## systemd
 

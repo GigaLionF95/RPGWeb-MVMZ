@@ -151,9 +151,10 @@ export class ZipArchive {
   /** Readable stream of the decompressed entry. */
   async stream(entry) {
     if (entry.encrypted) throw new Error(`password-protected zip entries are not supported (${entry.name})`);
+    // Empty entries (0-byte files) have no data to read.
+    if (entry.csize === 0) return (await import('node:stream')).Readable.from([]);
     const start = await this._dataOffset(entry);
     const raw = fs.createReadStream(null, { fd: this.fh.fd, start, end: start + entry.csize - 1, autoClose: false });
-    if (entry.csize === 0) { raw.destroy(); return (await import('node:stream')).Readable.from([]); }
     if (entry.method === 0) return raw;
     if (entry.method === 8) return raw.pipe(zlib.createInflateRaw());
     throw new Error(`unsupported zip compression method ${entry.method} (${entry.name})`);

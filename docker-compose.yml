@@ -14,8 +14,11 @@ services:
       #   docker compose exec rpgm-web node /app/bin/rpgm-web.js import "/imports/My Game.zip"
       - ./imports:/imports:ro
     environment:
+      # Both can be set in a .env file next to this one.
       # Fixed admin token for the web UI / API (otherwise one is generated)
-      # RPGM_ADMIN_TOKEN: change-me
+      RPGM_ADMIN_TOKEN: ${RPGM_ADMIN_TOKEN:-}
+      # Replica of another rpgm-web server (see README "Several servers")
+      RPGM_UPSTREAM: ${RPGM_UPSTREAM:-}
       # Hide the game list from visitors without the token
       # RPGM_PUBLIC_LIBRARY: "0"
       RPGM_MAX_UPLOAD_GB: "8"

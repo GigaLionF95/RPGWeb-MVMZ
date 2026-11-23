@@ -1,5 +1,6 @@
 // HTTP server: library UI, admin API, and game file serving.
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -12,6 +13,7 @@ import { importGame } from '../importer/index.js';
 import { ID_RE } from '../library.js';
 import { decrypt } from '../importer/rpgcrypt.js';
 import { compressAsync, patchId, PRE_DIR, PRE_EXT } from '../precompress.js';
+import { createSyncSource, Replica } from '../sync.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const WEB_DIR = path.join(ROOT, 'web');
@@ -115,6 +117,43 @@ export async function startServer(config, lib) {
   }
   const jobs = new Map(); // id -> job
   const importSlots = new Slots(config.importConcurrency || 1);
+  const syncSource = createSyncSource(lib);
+  const replica = config.upstream
+    ? new Replica(lib, { upstream: config.upstream, token: config.adminToken, intervalMs: config.syncIntervalMs, log: (m) => console.log(m) })
+    : null;
+
+  /** Replica: send an admin request on to the primary, streaming both ways. */
+  function proxyToPrimary(req, res, url, { inspect } = {}) {
+    const target = new URL(url.pathname + url.search, config.upstream + '/');
+    const mod = target.protocol === 'https:' ? https : http;
+    const headers = { ...req.headers, host: target.host };
+    delete headers.connection;
+    return new Promise((resolve) => {
+      const up = mod.request(target, { method: req.method, headers }, async (ur) => {
+        if (!inspect) {
+          res.writeHead(ur.statusCode, ur.headers);
+          ur.pipe(res);
+          ur.on('end', resolve);
+          ur.on('error', resolve);
+          return;
+        }
+        const chunks = [];
+        for await (const c of ur) chunks.push(c);
+        const body = Buffer.concat(chunks);
+        try { await inspect(ur.statusCode, body); } catch { /* sync errors show in /healthz */ }
+        const h = { ...ur.headers, 'content-length': body.length };
+        delete h['transfer-encoding'];
+        res.writeHead(ur.statusCode, h);
+        res.end(body);
+        resolve();
+      });
+      up.on('error', (e) => {
+        if (!res.headersSent) sendJson(res, 502, { error: `the primary server is unreachable (${e.message})` });
+        resolve();
+      });
+      req.pipe(up);
+    });
+  }
   const runtimeVersion = PKG.version + '-' + Math.floor(Date.now() / 1000).toString(36);
 
   const isAdmin = (req) => {
@@ -360,6 +399,42 @@ export async function startServer(config, lib) {
   async function handleApi(req, res, url) {
     const parts = url.pathname.split('/').filter(Boolean).slice(1); // drop 'api'
     const method = req.method;
+
+    // Library sync for replicas (admin token).
+    if (parts[0] === 'sync' && (method === 'GET' || method === 'HEAD')) {
+      requireAdmin(req);
+      if (parts.length === 1) return sendJson(res, 200, await syncSource.list());
+      const id = parts[1];
+      if (parts.length === 2) {
+        const e = await syncSource.game(id);
+        if (!e) throw new HttpError(404, 'game not found');
+        return sendJson(res, 200, { id, stamp: e.stamp, files: e.files });
+      }
+      if (parts[2] === 'file' && parts.length === 3) {
+        const file = await syncSource.file(id, url.searchParams.get('path'));
+        if (!file) throw new HttpError(404, 'not found');
+        const st = await fsp.stat(file);
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': st.size, 'Cache-Control': 'no-store' });
+        if (method === 'HEAD') return res.end();
+        return pipeline(fs.createReadStream(file), res).catch(() => {});
+      }
+      throw new HttpError(404, 'not found');
+    }
+
+    // Replica: the primary owns the library. Admin writes and import jobs go
+    // there; when a job finishes, pull the result before answering.
+    if (replica && (parts[0] === 'jobs' || (parts[0] === 'games' && method !== 'GET' && method !== 'HEAD'))) {
+      requireAdmin(req);
+      if (parts[0] === 'jobs') {
+        return proxyToPrimary(req, res, url, {
+          inspect: async (status, body) => { if (status === 200 && JSON.parse(body).status === 'done') await replica.syncNow(); },
+        });
+      }
+      await proxyToPrimary(req, res, url);
+      replica.poke();
+      return;
+    }
+
     if (parts[0] === 'auth' && method === 'GET') return sendJson(res, isAdmin(req) ? 200 : 401, { admin: isAdmin(req) });
     if (parts[0] === 'games' && parts.length === 1) {
       if (method === 'GET') {
@@ -475,7 +550,13 @@ export async function startServer(config, lib) {
         return res.end();
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'method not allowed');
-      if (p === '/healthz') return sendJson(res, 200, { ok: true, version: PKG.version });
+      if (p === '/healthz') {
+        return sendJson(res, 200, {
+          ok: true, version: PKG.version,
+          role: replica ? 'replica' : 'primary',
+          ...(replica ? { upstream: config.upstream, sync: replica.state } : {}),
+        });
+      }
       const play = /^\/play\/([^/]+)(?:\/(.*))?$/s.exec(p);
       if (play) {
         if (play[2] === undefined) { res.writeHead(301, { Location: `${play[1]}/${url.search}` }); return res.end(); }
@@ -518,6 +599,12 @@ export async function startServer(config, lib) {
   server.keepAliveTimeout = 30_000;
 
   await new Promise((resolve) => server.listen(config.port, config.host, resolve));
+  if (replica) {
+    console.log(`replica of ${config.upstream}: syncing every ${Math.round(config.syncIntervalMs / 1000)} s`);
+    replica.start();
+    server.on('close', () => replica.stop());
+    server.replica = replica;
+  }
   const shown = config.host === '0.0.0.0' ? 'localhost' : config.host;
   console.log(`rpgm-web ${PKG.version} listening on http://${shown}:${config.port}/  (data: ${config.dataDir})`);
   console.log(`admin token: run "rpgm-web token" (or set RPGM_ADMIN_TOKEN)`);

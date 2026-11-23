@@ -99,3 +99,36 @@ test('rejects folders without an RPG Maker game', async () => {
   const lib = new Library(path.join(work, 'data'));
   await assert.rejects(importGame(lib, path.join(work, 'empty')), /No RPG Maker MV\/MZ game found/);
 });
+
+test('imports Windows, Linux, macOS and Android builds; drops the NW.js runtime', async () => {
+  const work = await tmpdir();
+  const tree = await readTree(await makeGame(path.join(work, 'src'), 'mz', { title: 'Every Platform', extra: { 'data/empty.txt': '' } }));
+  const under = (prefix, extra = {}) => Object.fromEntries([...Object.entries(tree).map(([k, v]) => [prefix + k, v]), ...Object.entries(extra)]);
+  const pe = Buffer.alloc(128); pe.write('MZ', 0, 'latin1'); pe.writeUInt32LE(64, 0x3c); pe.write('PE\0\0', 64, 'latin1');
+  const elf = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]);
+  const macho = Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1]);
+  const builds = {
+    'windows.zip': under('game-windows/', {
+      'game-windows/Game.exe': pe, 'game-windows/nw.dll': pe, 'game-windows/resources.pak': 'x', 'game-windows/icudtl.dat': 'x',
+      'game-windows/locales/en-US.pak': 'x', 'game-windows/credits.html': '<h1>Chromium credits</h1>',
+      'game-windows/notes.txt': 'MZ is where it starts', // not a binary: must stay
+    }),
+    'linux.zip': under('game-linux/', { 'game-linux/Game': elf, 'game-linux/lib/libnw.so': elf, 'game-linux/swiftshader/libEGL.so': elf }),
+    'macos.zip': under('game-macos/Game.app/Contents/Resources/app.nw/', { 'game-macos/Game.app/Contents/MacOS/nwjs': macho, 'game-macos/Game.app/Contents/Info.plist': '<plist/>' }),
+    'android.apk': under('assets/www/', { 'AndroidManifest.xml': 'x', 'classes.dex': 'dex\n035', 'META-INF/MANIFEST.MF': 'x' }),
+  };
+  const lib = new Library(path.join(work, 'data'));
+  for (const [name, entries] of Object.entries(builds)) {
+    const file = path.join(work, name);
+    await fsp.writeFile(file, buildZip(entries));
+    const meta = await importGame(lib, file, { transcode: 'off', precompress: false, id: name.replace(/\W/g, '-') });
+    const g = await lib.get(meta.id);
+    assert.equal(meta.engine, 'mz', name);
+    assert.ok(g.fileSet.has('js/rmmz_core.js') && g.fileSet.has('index.html'), name);
+    assert.ok(g.fileSet.has('data/empty.txt'), `${name}: empty files survive`);
+    for (const runtime of ['Game.exe', 'nw.dll', 'resources.pak', 'icudtl.dat', 'locales/en-US.pak', 'credits.html', 'Game', 'lib/libnw.so', 'swiftshader/libEGL.so', 'classes.dex', 'AndroidManifest.xml']) {
+      assert.ok(!g.fileSet.has(runtime), `${name}: ${runtime} removed`);
+    }
+    if (name === 'windows.zip') assert.ok(g.fileSet.has('notes.txt'), 'text that merely starts with MZ stays');
+  }
+});

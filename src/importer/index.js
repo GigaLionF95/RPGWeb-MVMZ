@@ -77,6 +77,58 @@ async function bsdtarToTar(bin, file, dest, budget) {
   if (code !== 0) throw new Error(`${bin} could not read the archive: ${err.trim() || 'exit ' + code}`);
 }
 
+/**
+ * Desktop builds ship the NW.js runtime next to index.html (Windows: nw.dll,
+ * Game.exe...; Linux: lib/libnw.so, Game...). A browser never loads it:
+ * drop it so it does not take space on the server. Only the game's top
+ * folder is touched, and only things that are certainly the runtime.
+ */
+async function stripNwRuntime(root, log) {
+  const isNative = async (p) => {
+    let fh;
+    try {
+      fh = await fsp.open(p, 'r');
+      const b = Buffer.alloc(64);
+      const { bytesRead } = await fh.read(b, 0, 64, 0);
+      if (bytesRead < 4) return false;
+      const m = b.readUInt32BE(0);
+      if (m === 0x7f454c46) return true; // ELF
+      if (m === 0xfeedface || m === 0xfeedfacf || m === 0xcefaedfe || m === 0xcffaedfe || m === 0xcafebabe) return true; // Mach-O
+      if (b[0] !== 0x4d || b[1] !== 0x5a || bytesRead < 64) return false; // PE starts with "MZ"...
+      const pe = Buffer.alloc(4);
+      await fh.read(pe, 0, 4, b.readUInt32LE(0x3c));
+      return pe.toString('latin1') === 'PE\0\0'; // ...and has a PE header
+    } catch { return false; } finally { await fh?.close(); }
+  };
+  let freed = 0;
+  const drop = async (p) => {
+    const st = await fsp.stat(p);
+    if (st.isDirectory()) { for (const f of await listFiles(p)) freed += f[1]; } else freed += st.size;
+    await fsp.rm(p, { recursive: true, force: true });
+  };
+  for (const e of await fsp.readdir(root, { withFileTypes: true })) {
+    const p = path.join(root, e.name);
+    const n = e.name.toLowerCase();
+    if (e.isFile()) {
+      if (/\.(pak|dll|so|dylib)$/.test(n) || /^(icudtl\.dat|v8_context_snapshot\.bin|snapshot_blob\.bin|natives_blob\.bin|vk_swiftshader_icd\.json)$/.test(n) || (/^[^.]+$|\.(exe|node|bin|out)$/.test(n) && await isNative(p))) {
+        await drop(p);
+      } else if (n === 'credits.html') {
+        // NW.js ships Chromium's license list under this name
+        const head = (await fsp.readFile(p)).subarray(0, 65536).toString('utf8');
+        if (/chromium/i.test(head) && !/rpg ?maker/i.test(head)) await drop(p);
+      }
+    } else if (e.isDirectory()) {
+      if (n === 'swiftshader') await drop(p);
+      else if (n === 'lib' && (await fsp.readdir(p)).some((f) => /^lib(nw|node)\.so$/.test(f))) await drop(p);
+      else if (n === 'locales') {
+        const items = await fsp.readdir(p);
+        if (items.length && items.every((f) => /\.(pak|pak\.info)$/i.test(f))) await drop(p);
+      }
+    }
+  }
+  if (freed) log?.(`removed the desktop runtime (NW.js): ${(freed / 1048576).toFixed(0)} MB not needed in a browser`);
+}
+
 async function removeJunk(root) {
   const walk = async (dir) => {
     for (const e of await fsp.readdir(dir, { withFileTypes: true })) {
@@ -137,6 +189,7 @@ export async function importGame(lib, source, opts = {}) {
     if (root.startsWith(work + path.sep)) await fsp.rename(root, staged);
     else await fsp.cp(root, staged, { recursive: true });
     await removeJunk(staged);
+    await stripNwRuntime(staged, log);
 
     let files = await listFiles(staged);
     const info = await analyzeGame(staged, files);

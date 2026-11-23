@@ -26,7 +26,8 @@ Usage:
 Environment: RPGM_DATA, RPGM_PORT, RPGM_HOST, RPGM_ADMIN_TOKEN, RPGM_FFMPEG,
              RPGM_PUBLIC_LIBRARY (1/0), RPGM_MAX_UPLOAD_GB, RPGM_MODE=api,
              RPGM_FRAME_ANCESTORS, RPGM_PRECOMPRESS (1/0), RPGM_MAX_UNPACKED_GB,
-             RPGM_MAX_FILES, RPGM_IMPORT_CONCURRENCY
+             RPGM_MAX_FILES, RPGM_IMPORT_CONCURRENCY, RPGM_UPSTREAM (replica of
+             this primary), RPGM_SYNC_INTERVAL (seconds)
 `;
 
 const { values: opt, positionals } = parseArgs({
@@ -68,6 +69,7 @@ try {
       break;
     }
     case 'import': {
+      if (config.upstream) throw new Error(`this server is a replica of ${config.upstream}: import games on the primary, they appear here automatically`);
       if (!args[0]) throw new Error('import: missing <archive-or-folder>');
       let lastLine = '';
       const meta = await importGame(lib, path.resolve(args[0]), {
