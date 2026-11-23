@@ -1,0 +1,17 @@
+{
+  "name": "rpgm-web",
+  "version": "0.1.0",
+  "description": "Self-hosted web server that runs RPG Maker MV/MZ games in the browser",
+  "type": "module",
+  "bin": {
+    "rpgm-web": "bin/rpgm-web.js"
+  },
+  "scripts": {
+    "start": "node bin/rpgm-web.js serve",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

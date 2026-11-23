@@ -1,0 +1,32 @@
+# rpgm-web behind Cloudflare (proxied A record → this origin).
+# Cloudflare terminates TLS for visitors; in "Full" mode it reaches the
+# origin on 443 (certificate name is not checked), in "Flexible" on 80.
+server {
+    listen 80;
+    listen [::]:80;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name games.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+    access_log /var/log/nginx/rpgm-access.log;
+    error_log  /var/log/nginx/rpgm-error.log warn;
+
+    # Archive uploads stream straight to the app (Cloudflare itself caps
+    # request bodies at 100 MB on the free plan; bigger games: CLI import).
+    client_max_body_size 8g;
+
+    location / {
+        proxy_pass http://127.0.0.1:34210;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+        proxy_request_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+}

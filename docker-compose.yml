@@ -1,0 +1,18 @@
+services:
+  rpgm-web:
+    build: .
+    image: rpgm-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+      # Put archives here to import them with:
+      #   docker compose exec rpgm-web node /app/bin/rpgm-web.js import "/imports/My Game.zip"
+      - ./imports:/imports:ro
+    environment:
+      # Fixed admin token for the web UI / API (otherwise one is generated into data/config.json)
+      # RPGM_ADMIN_TOKEN: change-me
+      # Hide the game list from visitors without the token
+      # RPGM_PUBLIC_LIBRARY: "0"
+      RPGM_MAX_UPLOAD_GB: "8"
