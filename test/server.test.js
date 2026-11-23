@@ -19,14 +19,39 @@ before(async () => {
 });
 after(() => server.close());
 
-test('redirects to the revisioned URL and injects the runtime', async () => {
-  const r = await fetch(`${base}/play/served/?mute=1`, { redirect: 'manual' });
-  assert.equal(r.status, 302);
-  assert.equal(r.headers.get('location'), 'r1/?mute=1');
-  const html = await (await fetch(`${base}/play/served/r1/`)).text();
+test('serves the host page, then the sandboxed game with the runtime', async () => {
+  const host = await fetch(`${base}/play/served/?mute=1`, { redirect: 'manual' });
+  assert.equal(host.status, 200);
+  assert.equal(host.headers.get('content-security-policy'), null, 'host page keeps the real origin');
+  const page = await host.text();
+  const cfg = JSON.parse(/var G = (\{.*?\});/.exec(page)[1]);
+  assert.equal(cfg.src, 'r1/');
+  assert.match(cfg.sandbox, /allow-scripts/);
+  assert.doesNotMatch(cfg.sandbox, /allow-same-origin/);
+
+  const r = await fetch(`${base}/play/served/r1/`);
+  const csp = r.headers.get('content-security-policy');
+  assert.match(csp, /^sandbox allow-scripts /);
+  assert.doesNotMatch(csp, /allow-same-origin|allow-top-navigation/);
+  assert.equal(r.headers.get('access-control-allow-origin'), '*');
+  const html = await r.text();
   assert.match(html, /__RPGM_CONFIG=/);
+  assert.match(html, /"sandbox":true/);
   assert.match(html, /__rpgm\/runtime\.js/);
   assert.match(html, /width=device-width/);
+
+  // every file under the revision is sandboxed (an SVG or HTML from a game
+  // must never run with the site's origin)
+  const sys = await fetch(`${base}/play/served/r1/data/System.json`);
+  assert.match(sys.headers.get('content-security-policy'), /^sandbox /);
+  const redirect = await fetch(`${base}/play/served/data/System.json`, { redirect: 'manual' });
+  assert.equal(redirect.status, 302);
+  assert.equal(redirect.headers.get('location'), 'r1/data/System.json');
+  const pre = await fetch(`${base}/play/served/r1/data/System.json`, { method: 'OPTIONS', headers: { 'Access-Control-Request-Headers': 'x-foo' } });
+  assert.equal(pre.status, 204);
+  assert.equal(pre.headers.get('access-control-allow-headers'), 'x-foo');
+  const icon = await fetch(`${base}/api/games/served/icon`);
+  assert.match(icon.headers.get('content-security-policy'), /^sandbox/);
 });
 
 test('serves files case-insensitively with immutable caching and hooks core scripts', async () => {

@@ -18,59 +18,118 @@
   var R = (window.__RPGM = { config: CFG, version: CFG.runtimeVersion, hooksRun: {} });
   var log = function () { if (params.has('rpgm-debug')) console.log.apply(console, ['[rpgm]'].concat([].slice.call(arguments))); };
 
+  // The game runs inside /play/<id>/ (web/play.html), in a sandboxed frame with
+  // an opaque origin: it cannot reach the site's storage, cookies or admin
+  // token. The host page (our code, real origin) keeps the saves and talks to
+  // the game over postMessage. HERE is the server origin the host lives on.
+  var HERE = new URL(location.href).origin;
+  var SANDBOX = !!CFG.sandbox;
+  if (window.parent === window) {
+    // Opened directly (old link or bookmark): go through the host page.
+    location.replace('../' + location.search + location.hash);
+    return;
+  }
+
+  // Compatibility with the opaque origin. Every request to the server is now
+  // cross-origin (the server answers with CORS headers):
+  if (SANDBOX) {
+    // - images/videos from the server need CORS mode, or WebGL refuses them
+    //   (PIXI thinks they are same-origin and would not ask for it);
+    var corsify = function (proto, prop) {
+      var d = proto && Object.getOwnPropertyDescriptor(proto, prop);
+      if (!d || !d.set) return;
+      Object.defineProperty(proto, prop, {
+        configurable: true, enumerable: d.enumerable, get: d.get,
+        set: function (v) {
+          try { if (this.crossOrigin == null && new URL(String(v), location.href).origin === HERE) this.crossOrigin = 'anonymous'; } catch (e) { /* keep as is */ }
+          d.set.call(this, v);
+        },
+      });
+    };
+    corsify(window.HTMLImageElement && HTMLImageElement.prototype, 'src');
+    corsify(window.HTMLMediaElement && HTMLMediaElement.prototype, 'src');
+    // - a Worker script must be same-origin: start it from a blob instead
+    //   (MZ decodes Ogg audio in a worker);
+    var OrigWorker = window.Worker;
+    if (OrigWorker) {
+      var SandboxWorker = function (url, opts) {
+        var abs = null;
+        try { abs = new URL(String(url), location.href); } catch (e) { /* let the browser report it */ }
+        if (!abs || abs.origin !== HERE) return new OrigWorker(url, opts);
+        var code = opts && opts.type === 'module' ? 'import ' + JSON.stringify(abs.href) + ';' : 'importScripts(' + JSON.stringify(abs.href) + ');';
+        return new OrigWorker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })), opts);
+      };
+      SandboxWorker.prototype = OrigWorker.prototype;
+      window.Worker = SandboxWorker;
+    }
+    // - document.cookie and sessionStorage throw in an opaque origin.
+    var memStore = function () {
+      var m = new Map();
+      return {
+        getItem: function (k) { return m.has(String(k)) ? m.get(String(k)) : null; },
+        setItem: function (k, v) { m.set(String(k), String(v)); },
+        removeItem: function (k) { m.delete(String(k)); },
+        clear: function () { m.clear(); },
+        key: function (i) { return Array.from(m.keys())[i] || null; },
+        get length() { return m.size; },
+      };
+    };
+    try { void window.sessionStorage; } catch (e) {
+      var ss = memStore();
+      try { Object.defineProperty(window, 'sessionStorage', { configurable: true, get: function () { return ss; } }); } catch (e2) { /* ignore */ }
+    }
+    try { void document.cookie; } catch (e) {
+      var jar = '';
+      try { Object.defineProperty(document, 'cookie', { configurable: true, get: function () { return jar; }, set: function (v) { jar = String(v).split(';')[0]; } }); } catch (e2) { /* ignore */ }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Persistent key/value store (in memory, mirrored to IndexedDB)
   // ---------------------------------------------------------------------------
-  var DB_NAME = 'rpgm-web';
-  var STORE = 'kv';
   var PREFIX = GAME_ID + '\u0001';
   var mem = new Map();
   var dirty = new Map(); // key -> value | DELETE
   var DELETE = {};
-  var db = null;
   var flushTimer = null;
   var persistentOk = true;
 
-  function idbOpen() {
-    return new Promise(function (resolve, reject) {
-      var req;
-      try { req = indexedDB.open(DB_NAME, 1); } catch (e) { reject(e); return; }
-      req.onupgradeneeded = function () { req.result.createObjectStore(STORE); };
-      req.onsuccess = function () { resolve(req.result); };
-      req.onerror = function () { reject(req.error); };
-    });
-  }
-
-  function idbLoad() {
-    return idbOpen().then(function (d) {
-      db = d;
-      return new Promise(function (resolve, reject) {
-        var tx = db.transaction(STORE, 'readonly');
-        var range = IDBKeyRange.bound(PREFIX, GAME_ID + '\u0002', false, true);
-        var req = tx.objectStore(STORE).openCursor(range);
-        req.onsuccess = function () {
-          var c = req.result;
-          if (!c) return;
-          mem.set(String(c.key).slice(PREFIX.length), c.value);
-          c.continue();
-        };
-        tx.oncomplete = function () { resolve(); };
-        tx.onerror = function () { reject(tx.error); };
-      });
-    }).catch(function (e) {
-      persistentOk = false;
-      console.warn('[rpgm-web] IndexedDB unavailable, saves will not persist:', e);
+  // Saves live in the host page's IndexedDB (same database and keys as
+  // before the sandbox, so existing saves carry over).
+  function hostLoad() {
+    return new Promise(function (resolve) {
+      var done = false;
+      function onMsg(e) {
+        var d = e.data;
+        if (e.source !== window.parent || e.origin !== HERE || !d || d.rpgm !== 1 || d.type !== 'kv-data') return;
+        done = true;
+        removeEventListener('message', onMsg);
+        if (!d.ok) { persistentOk = false; console.warn('[rpgm-web] browser storage unavailable, saves will not persist:', d.error); }
+        (d.entries || []).forEach(function (kv) { mem.set(kv[0], kv[1]); });
+        resolve();
+      }
+      addEventListener('message', onMsg);
+      postParent({ type: 'kv-load' });
+      setTimeout(function () {
+        if (done) return;
+        removeEventListener('message', onMsg);
+        persistentOk = false;
+        console.warn('[rpgm-web] no answer from the host page, saves will not persist');
+        resolve();
+      }, 10000);
     });
   }
 
   // Cloud saves: when the embedding site opted in (iframe URL has cloud=1),
   // the site stores saves under its own accounts via the postMessage bridge
   // (see web/sdk.js). Then the site, not this browser, is the storage.
-  var CLOUD_WANTED = params.get('cloud') === '1' && window.parent !== window;
+  var CLOUD_WANTED = params.get('cloud') === '1';
   var cloud = { active: false, timer: null, seq: 0, lastError: null };
+  // Only ever to our host page (never '*': saves must not leak to a foreign
+  // page that frames the game directly). The host relays cloud messages.
   function postParent(msg) {
     msg.rpgm = 1; msg.game = GAME_ID;
-    try { window.parent.postMessage(msg, '*'); } catch (e) { /* detached */ }
+    try { window.parent.postMessage(msg, HERE); } catch (e) { /* detached */ }
   }
   function cloudSnapshot() {
     var entries = {};
@@ -88,7 +147,7 @@
       var done = false;
       function onMsg(e) {
         var d = e.data;
-        if (e.source !== window.parent || !d || d.rpgm !== 1 || d.type !== 'saves' || d.game !== GAME_ID) return;
+        if (e.source !== window.parent || e.origin !== HERE || !d || d.rpgm !== 1 || d.type !== 'saves' || d.game !== GAME_ID) return;
         done = true;
         removeEventListener('message', onMsg);
         resolve(d);
@@ -111,20 +170,11 @@
       cloud.timer = setTimeout(cloudPush, 150);
       return;
     }
-    if (!db || !dirty.size) return;
-    var batch = dirty;
+    if (!dirty.size) return;
+    var ops = [];
+    dirty.forEach(function (v, k) { ops.push(v === DELETE ? [k] : [k, v]); });
     dirty = new Map();
-    try {
-      var tx = db.transaction(STORE, 'readwrite');
-      var st = tx.objectStore(STORE);
-      batch.forEach(function (v, k) {
-        if (v === DELETE) st.delete(PREFIX + k);
-        else st.put(v, PREFIX + k);
-      });
-      tx.onerror = function () { console.error('[rpgm-web] failed to persist saves', tx.error); };
-    } catch (e) {
-      console.error('[rpgm-web] failed to persist saves', e);
-    }
+    postParent({ type: 'kv-write', ops: ops });
   }
   function schedule() { if (!flushTimer) flushTimer = setTimeout(flush, 0); }
   function kvGet(k) { return mem.get(k); }
@@ -144,7 +194,6 @@
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') flushNow(); });
   R.store = { get: kvGet, set: kvSet, del: kvDel, keys: kvKeys, flush: flush };
 
-  try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) { /* optional */ }
 
   // ---------------------------------------------------------------------------
   // Game file manifest (for fs.existsSync / readdirSync)
@@ -561,11 +610,9 @@
   var ROOT = CFG.library || '/';
   function backToLibrary() {
     flushNow();
-    if (!EMBED) { location.href = ROOT; return; }
-    postParent({ type: 'exit' });
-    var keep = new URLSearchParams();
-    ['mute', 'cloud'].forEach(function (k) { if (params.get(k)) keep.set(k, params.get(k)); });
-    location.href = ROOT + 'embed/' + encodeURIComponent(GAME_ID) + '/' + (keep.toString() ? '?' + keep : '');
+    if (EMBED) postParent({ type: 'exit' });
+    // The sandbox cannot navigate the tab; the host page does it.
+    postParent({ type: 'nav', to: EMBED ? 'embed' : 'library' });
   }
   function openInNewTab() {
     flushNow();
@@ -804,13 +851,13 @@
   // ---------------------------------------------------------------------------
   var ready = false;
   function storageLoad() {
-    if (!CLOUD_WANTED) return idbLoad();
+    if (!CLOUD_WANTED) return hostLoad();
     return cloudLoad().then(function (r) {
       if (r.error) {
         cloud.lastError = r.error;
         console.warn('[rpgm-web] cloud saves unavailable (' + r.error + '); saving in this browser instead');
         R.cloudFallback = true;
-        return idbLoad();
+        return hostLoad();
       }
       cloud.active = true;
       var entries = r.data && r.data.entries;

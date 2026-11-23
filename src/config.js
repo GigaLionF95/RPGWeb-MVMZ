@@ -27,6 +27,9 @@ export function loadConfig(flags = {}) {
     // CSP frame-ancestors for embeds: '*' (anyone) or a space-separated list of origins
     frameAncestors: process.env.RPGM_FRAME_ANCESTORS || saved.frameAncestors || '*',
     trustProxy: bool(process.env.RPGM_TRUST_PROXY, saved.trustProxy ?? false),
+    // Run games in an opaque-origin sandbox (see README "Security"). Only
+    // turn off to debug a game that misbehaves in it.
+    gameSandbox: bool(process.env.RPGM_GAME_SANDBOX, saved.gameSandbox ?? true),
     // Caps for unpacking uploaded archives (zip bombs and the like).
     limits: {
       maxBytes: Number(process.env.RPGM_MAX_UNPACKED_GB || saved.maxUnpackedGB || 20) * 1024 ** 3,

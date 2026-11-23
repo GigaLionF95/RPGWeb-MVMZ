@@ -18,6 +18,11 @@ const WEB_DIR = path.join(ROOT, 'web');
 const RUNTIME_DIR = path.join(ROOT, 'runtime');
 const PKG = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 
+// Game documents get an opaque origin: game code cannot read this site's
+// storage, cookies or admin token, nor call the API with them. Downloads,
+// popups (links), dialogs and pointer lock keep working.
+export const GAME_SANDBOX = 'allow-scripts allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads allow-forms allow-orientation-lock allow-presentation';
+
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
@@ -193,10 +198,15 @@ export async function startServer(config, lib) {
     // /play/<id>/  → versioned base so every asset URL can be cached forever.
     const m = /^r(\d+)\/(.*)$/s.exec(rest);
     if (!m) {
+      if (rest === '' || rest.toLowerCase() === 'index.html') return servePlayHost(req, res, id, g);
       res.writeHead(302, { Location: `r${meta.rev}/${rest}${search}`, 'Cache-Control': 'no-store' });
       res.end();
       return;
     }
+    // Everything under r<rev>/ is game content: sandboxed, and reachable
+    // from the sandbox's opaque origin (CORS).
+    setFrameHeaders(res, true, config.gameSandbox !== false ? `sandbox ${GAME_SANDBOX}` : null);
+    res.setHeader('Access-Control-Allow-Origin', '*');
     const rev = Number(m[1]);
     let rel = m[2];
     const current = rev === meta.rev;
@@ -207,7 +217,7 @@ export async function startServer(config, lib) {
       const cfg = {
         id, engine: meta.engine, title: meta.title, rev: meta.rev,
         mzGameId: meta.mzGameId, runtimeVersion, media: meta.media,
-        library: '../../../',
+        library: '../../../', sandbox: config.gameSandbox !== false,
       };
       return sendFile(req, res, path.join(lib.rootDir(id), indexRel), {
         type: 'text/html; charset=utf-8', cacheControl: 'no-cache',
@@ -230,7 +240,7 @@ export async function startServer(config, lib) {
       if (name === 'manifest.webmanifest') {
         const icon = meta.icon ? [{ src: '../' + meta.icon.split('/').map(encodeURIComponent).join('/'), sizes: 'any', type: 'image/png' }] : [];
         return sendJson(res, 200, {
-          name: meta.title, short_name: meta.title.slice(0, 24), start_url: './', scope: './',
+          name: meta.title, short_name: meta.title.slice(0, 24), start_url: '../../', scope: '../../',
           display: 'fullscreen', orientation: 'landscape', background_color: '#000000', theme_color: '#000000', icons: icon,
         });
       }
@@ -364,6 +374,8 @@ export async function startServer(config, lib) {
       const id = parts[1];
       const g = await lib.get(id);
       if (!g) throw new HttpError(404, 'game not found');
+      // Images come from the game: never let one run as a document here.
+      if (parts[2] === 'icon' || parts[2] === 'cover') res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'");
       if (parts[2] === 'icon' && method === 'GET') {
         if (!g.meta.icon) throw new HttpError(404, 'no icon');
         return sendFile(req, res, path.join(lib.rootDir(id), g.meta.icon), { cacheControl: 'public, max-age=3600' });
@@ -397,13 +409,33 @@ export async function startServer(config, lib) {
 
   // ---- embeds ----------------------------------------------------------------
   /** Games and the embed page may be framed (as configured); the admin UI may not. */
-  function setFrameHeaders(res, embeddable) {
+  function setFrameHeaders(res, embeddable, extraCsp = null) {
+    const csp = extraCsp ? [extraCsp] : [];
     if (!embeddable) {
       res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-      res.setHeader('Content-Security-Policy', "frame-ancestors 'self'");
+      csp.push("frame-ancestors 'self'");
     } else if (config.frameAncestors && config.frameAncestors !== '*') {
-      res.setHeader('Content-Security-Policy', `frame-ancestors 'self' ${config.frameAncestors}`);
+      csp.push(`frame-ancestors 'self' ${config.frameAncestors}`);
     }
+    if (csp.length) res.setHeader('Content-Security-Policy', csp.join('; '));
+  }
+
+  /** /play/<id>/: our host page, which keeps saves and frames the sandboxed game. */
+  async function servePlayHost(req, res, id, g) {
+    const { meta } = g;
+    const cfg = {
+      id, title: meta.title,
+      src: `r${meta.rev}/`,
+      manifest: `r${meta.rev}/__rpgm/manifest.webmanifest`,
+      library: '../../',
+      embed: `../../embed/${id}/`,
+      sandbox: config.gameSandbox !== false ? GAME_SANDBOX : null,
+    };
+    return sendFile(req, res, path.join(WEB_DIR, 'play.html'), {
+      type: 'text/html; charset=utf-8', cacheControl: 'no-cache',
+      transform: (buf) => Buffer.from(buf.toString('utf8').replace('/*RPGM_PLAY*/null', JSON.stringify(cfg).replace(/</g, '\\u003c'))),
+      cacheKey: `play|${id}|${g.mtime}|${runtimeVersion}`, etagSeed: `h${Math.floor(g.mtime).toString(36)}-${runtimeVersion}-`,
+    });
   }
 
   async function serveEmbed(req, res, id) {
@@ -432,6 +464,16 @@ export async function startServer(config, lib) {
       url = new URL(req.url, 'http://x');
       const p = url.pathname;
       if (p.startsWith('/api/')) return await handleApi(req, res, url);
+      if (req.method === 'OPTIONS' && p.startsWith('/play/')) {
+        // CORS preflight from the sandboxed game (plugins sending custom headers).
+        res.writeHead(204, {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, HEAD',
+          'Access-Control-Allow-Headers': String(req.headers['access-control-request-headers'] || '').slice(0, 1000),
+          'Access-Control-Max-Age': '86400',
+        });
+        return res.end();
+      }
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'method not allowed');
       if (p === '/healthz') return sendJson(res, 200, { ok: true, version: PKG.version });
       const play = /^\/play\/([^/]+)(?:\/(.*))?$/s.exec(p);

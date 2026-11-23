@@ -203,6 +203,7 @@ curl -H "Authorization: Bearer $TOKEN" --data-binary @game.zip \
 | `RPGM_MAX_UNPACKED_GB` | `20` | an archive that unpacks to more is rejected (zip bombs) |
 | `RPGM_MAX_FILES` | `200000` | maximum number of files in an archive |
 | `RPGM_IMPORT_CONCURRENCY` | `1` | imports running at once; the rest wait in a queue |
+| `RPGM_GAME_SANDBOX` | `1` | `0`: run games without the opaque-origin sandbox (debugging only, see Security) |
 | `RPGM_PRECOMPRESS` | `1` | `0`: skip making `.br`/`.gz` copies at import (compress on the fly only) |
 
 ## systemd
@@ -260,7 +261,7 @@ What the server sends:
 
 | URL | `Cache-Control` | Why |
 |---|---|---|
-| `/play/<id>/` | `no-store` | redirects to the current revision, `/play/<id>/r<rev>/` |
+| `/play/<id>/` | `no-cache` | host page: keeps saves, frames the sandboxed game from the current revision, `/play/<id>/r<rev>/` |
 | `/play/<id>/r<rev>/` (index.html), engine scripts `rpg_*.js` / `rmmz_*.js` / `plugins.js` | `no-cache` + `ETag` | patched at serve time with the runtime; revalidated, usually a `304` |
 | every other file under `/play/<id>/r<rev>/` | `public, max-age=31536000, immutable` | the revision is in the URL: re-importing a game bumps it, so a cached file is never stale |
 | `/api/…` | `no-store` | |
@@ -367,7 +368,22 @@ Only the admin can import games (token-protected API and CLI). The importer stil
 - 7z/rar never touch the disk through bsdtar directly: bsdtar re-packs them into a tar stream, and rpgm-web's own extractor applies the same checks;
 - imports run one at a time with low CPU priority (ffmpeg, bsdtar), so a big upload does not slow down people who are playing.
 
-**Do not host games you do not trust.** A game is JavaScript, and it runs on the server's origin, like the library page. A malicious game could read the admin token from the library page's storage, or other games' browser saves. If strangers can submit games, review them before importing.
+### Games run in a sandbox
+
+A game is someone else's JavaScript, so it never runs with your site's origin. That holds on a single domain, with no extra setup:
+
+- `/play/<id>/` is a small host page (ours). It frames the game from `/play/<id>/r<rev>/`.
+- Every file under `/play/<id>/r<rev>/` is sent with `Content-Security-Policy: sandbox allow-scripts …` (no `allow-same-origin`), and the frame carries the same `sandbox` attribute. The browser gives the game an **opaque origin**, even when a game file is opened directly or in a popup.
+- From there, game code cannot read the library's `localStorage` (the admin token), cookies or IndexedDB. It cannot script the library page in a frame or popup, and it cannot read API responses.
+- Saves stay where they were. The host page keeps them in the site's IndexedDB and hands each game only its own, over `postMessage`. Saves made before the sandbox carry over.
+- Cloud saves work as before: the host page relays the SDK messages between the game and the embedding site.
+
+The runtime smooths over what the opaque origin changes:
+- game files are served with CORS and loaded in CORS mode (WebGL needs it);
+- workers, such as MZ's audio decoder, start from a blob;
+- `document.cookie` and `sessionStorage` get in-memory stand-ins.
+
+Both test games (MV and MZ) run unchanged in Chrome and Firefox. If a game still misbehaves, `RPGM_GAME_SANDBOX=0` turns the sandbox off for debugging. Do not run like that with games you do not trust.
 
 ## Limitations
 

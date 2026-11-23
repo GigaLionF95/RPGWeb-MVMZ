@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="robots" content="noindex">
+<title>Play</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; display: block; background: #000; }
+</style>
+</head>
+<body>
+<!-- "*": the sandboxed game has an opaque origin, which never matches the
+     default allowlist (the frame's URL), so features must be granted to any. -->
+<iframe id="game" title="Game" allow="fullscreen *; autoplay *; gamepad *; clipboard-write *; screen-wake-lock *"></iframe>
+<script>
+/*
+ * Host page for one game. The game itself runs in the frame below with an
+ * opaque origin (CSP sandbox from the server + the sandbox attribute), so its
+ * code cannot touch this site's storage, cookies or admin token. This page is
+ * ours: it keeps the game's saves in IndexedDB and passes them to the game,
+ * relays cloud-save messages to an embedding site, and leaves the game when
+ * asked. It only ever serves the game it was opened for.
+ */
+(function () {
+  'use strict';
+  var G = /*RPGM_PLAY*/null;
+  if (!G) return;
+  var frame = document.getElementById('game');
+  var PREFIX = G.id + '\u0001';
+  document.title = G.title;
+  frame.title = G.title;
+  if (G.manifest) {
+    var link = document.createElement('link');
+    link.rel = 'manifest';
+    link.href = G.manifest;
+    document.head.appendChild(link);
+  }
+
+  // ---- saves: same database and keys the game used before the sandbox ----
+  var dbp = new Promise(function (resolve, reject) {
+    var req;
+    try { req = indexedDB.open('rpgm-web', 1); } catch (e) { reject(e); return; }
+    req.onupgradeneeded = function () { req.result.createObjectStore('kv'); };
+    req.onsuccess = function () { resolve(req.result); };
+    req.onerror = function () { reject(req.error); };
+  });
+  dbp.catch(function (e) { console.warn('[rpgm-web] IndexedDB unavailable:', e); });
+  try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) { /* optional */ }
+
+  function load() {
+    return dbp.then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var out = [];
+        var tx = db.transaction('kv', 'readonly');
+        var req = tx.objectStore('kv').openCursor(IDBKeyRange.bound(PREFIX, G.id + '\u0002', false, true));
+        req.onsuccess = function () {
+          var c = req.result;
+          if (!c) return;
+          out.push([String(c.key).slice(PREFIX.length), c.value]);
+          c.continue();
+        };
+        tx.oncomplete = function () { resolve(out); };
+        tx.onerror = function () { reject(tx.error); };
+      });
+    });
+  }
+  function write(ops) {
+    // Transactions are created in message order, so writes land in order.
+    dbp.then(function (db) {
+      var tx = db.transaction('kv', 'readwrite');
+      var st = tx.objectStore('kv');
+      ops.forEach(function (op) {
+        if (!Array.isArray(op) || typeof op[0] !== 'string') return;
+        if (op.length < 2) st.delete(PREFIX + op[0]);
+        else st.put(op[1], PREFIX + op[0]);
+      });
+      tx.onerror = function () { console.error('[rpgm-web] failed to persist saves', tx.error); };
+    }).catch(function () { /* reported at open */ });
+  }
+
+  // ---- messages ----
+  function toGame(msg) {
+    msg.rpgm = 1;
+    msg.game = G.id;
+    // The game's origin is opaque, so it cannot be named; the source check
+    // on its side and ours keep the channel between these two windows.
+    if (frame.contentWindow) frame.contentWindow.postMessage(msg, '*');
+  }
+  var embedded = window.parent !== window;
+  var RELAY_UP = { hello: 1, save: 1, started: 1, exit: 1 };
+  var RELAY_DOWN = { saves: 1, saved: 1 };
+
+  function navigate(to) {
+    if (to === 'embed') {
+      var q = new URLSearchParams(location.search), keep = new URLSearchParams();
+      ['mute', 'cloud'].forEach(function (k) { if (q.get(k)) keep.set(k, q.get(k)); });
+      location.href = G.embed + (keep.toString() ? '?' + keep : '');
+    } else {
+      location.href = G.library;
+    }
+  }
+
+  addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || typeof d !== 'object' || d.rpgm !== 1) return;
+    if (e.source === frame.contentWindow) {
+      if (d.type === 'kv-load') {
+        load().then(
+          function (entries) { toGame({ type: 'kv-data', ok: true, entries: entries }); },
+          function (err) { toGame({ type: 'kv-data', ok: false, error: String((err && err.message) || err), entries: [] }); }
+        );
+      } else if (d.type === 'kv-write') {
+        if (Array.isArray(d.ops)) write(d.ops);
+      } else if (d.type === 'nav') {
+        navigate(d.to);
+      } else if (RELAY_UP[d.type]) {
+        if (embedded) {
+          d.game = G.id; // the game cannot speak for another game
+          window.parent.postMessage(d, '*');
+        } else if (d.type === 'hello' && d.cloud) {
+          toGame({ type: 'saves', error: 'cloud saves need an embedding page' });
+        }
+      }
+    } else if (embedded && e.source === window.parent && RELAY_DOWN[d.type]) {
+      toGame({ type: d.type, data: d.data, error: d.error, seq: d.seq, ok: d.ok });
+    }
+  });
+
+  // ---- start ----
+  if (G.sandbox) frame.setAttribute('sandbox', G.sandbox);
+  frame.addEventListener('load', function () { try { frame.focus(); } catch (e) { /* ignore */ } });
+  // Keyboard input goes to the game whenever this page has focus.
+  addEventListener('focus', function () { try { frame.contentWindow.focus(); } catch (e) { /* ignore */ } });
+  frame.src = G.src + location.search + location.hash;
+})();
+</script>
+</body>
+</html>
