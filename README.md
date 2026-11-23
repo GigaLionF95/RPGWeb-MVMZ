@@ -7,6 +7,7 @@ One Node.js process, zero npm dependencies. Game files on disk are never modifie
 
 - **Library or API-only server.** A small library page for players, or no public page at all: you drive it through the HTTP API and CLI.
 - **Embeds, like itch.io.** Put any game on another website with an `<iframe>`. Visitors see a cover with a play button and the game starts on click.
+- **Bring desktop saves.** Players who started on the downloaded `.exe` import their save folder (or a `.zip` of it) from the in-game menu and continue in the browser or on a phone.
 - **Cloud saves on your side.** With the JS SDK, players sign in with *your* site's accounts and their saves are stored by *your* backend, so they follow the player to any device. rpgm-web never sees your users, cookies or tokens.
 
 ## How it works
@@ -27,35 +28,92 @@ The importer understands:
 - NW.js `package.nw` or a zip appended to the `.exe`;
 - **Dragonhouse/Halva** packaging (`GameConfig.sbcf` + `*.halva2`).
 
-## Quick start
+## Installation
 
-### Docker
+You need a computer or server that stays on: a VPS, a home server, or your PC for testing. The steps below run commands in a terminal on that machine. Everything happens inside the project folder, so step 1 (getting the code) is not optional: `docker compose` alone does nothing without it.
+
+### Option A: Docker (recommended)
+
+**1. Install Docker.** On a Linux server: <https://docs.docker.com/engine/install/>. On Windows or macOS: Docker Desktop. Check that it works:
+
+```bash
+docker compose version
+```
+
+**2. Download rpgm-web** and go into its folder:
+
+```bash
+git clone https://github.com/GigaLionF95/RPGWeb-MVMZ.git
+```
+
+```bash
+cd RPGWeb-MVMZ
+```
+
+No `git`? Download <https://github.com/GigaLionF95/RPGWeb-MVMZ/archive/refs/heads/main.zip>, unzip it, and open a terminal in the unzipped folder (`RPGWeb-MVMZ-main`).
+
+**3. Start it** (still inside that folder). The first start takes a few minutes while Docker builds the image:
 
 ```bash
 docker compose up -d --build
 ```
 
-The server listens on <http://localhost:8080/>. The admin token is stored in `data/config.json`; print it with:
+**4. Open the library** at `http://<your server's IP>:8080/` (on your own PC: <http://localhost:8080/>). Port 8080 taken? Create a file named `.env` in the folder with `RPGM_HTTP_PORT=9000` and run step 3 again.
+
+**5. Get your admin token.** You need it to add games:
 
 ```bash
 docker compose exec rpgm-web node /app/bin/rpgm-web.js token
 ```
 
-Add a game from the web page (**Admin** → paste the token → **Add game** → drop an archive) or from the command line:
+**6. Add a game.** On the library page, click **Admin**, paste the token, then **Add game** and drop the game's archive (the `.zip` you downloaded from itch.io or similar). That's it: click the game to play.
+
+For big archives (over 100 MB behind Cloudflare), copy them into the `imports` folder and import from the terminal:
 
 ```bash
-mkdir -p imports && cp "$HOME/Downloads/My Game.zip" imports/
 docker compose exec rpgm-web node /app/bin/rpgm-web.js import "/imports/My Game.zip"
 ```
 
-### Without Docker
+**Update to a new version** (games and saves are kept):
 
-Requires Node.js 20+. Install `ffmpeg` for mobile audio/video and `bsdtar` for 7z/rar.
+```bash
+git pull
+```
+
+```bash
+docker compose up -d --build
+```
+
+The library lives in a Docker volume named `rpgm-data`. `docker compose down` keeps it; `docker compose down -v` deletes it with every game in it.
+
+#### Something went wrong?
+
+| What you see | What to do |
+|---|---|
+| `no configuration file provided: not found` | You are not in the project folder. `cd RPGWeb-MVMZ` (step 2) and run the command again. |
+| `docker: 'compose' is not a docker command` | Old Docker. Install the current version (step 1), or try `docker-compose` with a dash. |
+| `permission denied ... docker.sock` | Run the commands with `sudo`, or add your user to the `docker` group. |
+| `port is already allocated` | Something else uses 8080. Pick another port (step 4). |
+| The page does not open from another computer | Open the port in your server's firewall, e.g. `sudo ufw allow 8080`. |
+| Logs | `docker compose logs -f` |
+
+### Option B: Node.js, without Docker
+
+**1. Install Node.js 20 or newer** from <https://nodejs.org/> and check it with `node -v`. Optional: `ffmpeg` (converts audio/video for phones at import) and `bsdtar` (opens `.7z` and `.rar`).
+
+**2. Download rpgm-web** (step 2 of Option A) and go into its folder. There is nothing to `npm install`: rpgm-web has no dependencies.
+
+**3. Import a game and start the server:**
 
 ```bash
 node bin/rpgm-web.js import "$HOME/Downloads/My Game.zip"
+```
+
+```bash
 node bin/rpgm-web.js serve --port 8080
 ```
+
+Open <http://localhost:8080/>. The server stops when you close the terminal. To keep it running on a server, use the [systemd unit](#systemd).
 
 ## CLI
 
@@ -349,8 +407,18 @@ After that, each new map, battle or cutscene pulls only its own files. A game ca
 - Stored in the player's browser (IndexedDB), separately for each game, without the 5 MB `localStorage` limit. With cloud saves, stored by the embedding site instead.
 - The in-game menu (top-left corner; appears on mouse hover, always visible on phones):
   - **Export saves** downloads a JSON file with every save;
-  - **Import saves** accepts that JSON or **desktop save files** (`file1.rpgsave`, `global.rpgsave`, `config.rpgsave`, or `*.rmmzsave`). For MV, include `global.rpgsave` together with the slot files: the game builds its save list from it.
+  - **Import saves** restores that JSON, or brings over progress from the **desktop version** of the game.
 - If the browser clears site data, local saves are gone. The server asks the browser for persistent storage, but export important progress.
+
+### Continue a desktop playthrough in the browser
+
+Played the downloaded `.exe` version and want to carry on in the browser (or on a phone)? Open the game, then the menu (top-left) → **Import saves…**. The dialog shows where this game keeps its saves on Windows, worked out from the game's own code and plugins. For example, `<game folder>\save` (MZ), `<game folder>\www\save` (MV), or `%LOCALAPPDATA%\<Game>\save` for games that move it. Then do one of these:
+
+- **Choose folder**, and pick that save folder;
+- **Choose files**, and select every file in it;
+- drag the folder, or a `.zip` of it, onto the game (handy for moving saves to a phone: zip the folder, send it over, import it there).
+
+The whole folder is copied, including `global.rpgsave` / `global.rmmzsave` (without it the save list looks empty) and any extra files plugins keep there. Slots that already exist in the browser are replaced only after a confirmation. The game then reloads with the imported saves. It works the other way round too: **Export saves** produces a file you can import on another device.
 
 ## Phones
 

@@ -1031,28 +1031,164 @@
     } catch (e) { console.warn('[rpgm-web] could not resolve the save folder', e); }
     return GAME_ROOT + '/save';
   }
-  function importSaveFiles(files) {
-    var tasks = Array.from(files).map(function (f) {
-      if (/\.json$/i.test(f.name)) {
-        return f.text().then(function (text) {
-          var data = JSON.parse(text);
-          if (data.format !== 'rpgm-web-saves') throw new Error(f.name + ': not an rpgm-web save export');
-          Object.keys(data.entries).forEach(function (k) { kvSet(k, decodeValue(data.entries[k])); });
-          return Object.keys(data.entries).length;
-        });
-      }
-      if (!/\.(rpgsave|rmmzsave)(\.bak|_)?$/i.test(f.name)) return Promise.reject(new Error(f.name + ': not an RPG Maker save file (.rpgsave / .rmmzsave)'));
-      return f.arrayBuffer().then(function (buf) {
-        var dir = saveDir();
-        if (!fsMod.existsSync(dir)) fsMod.mkdirSync(dir, { recursive: true });
-        fsMod.writeFileSync(dir.replace(/\/$/, '') + '/' + f.name, new Uint8Array(buf));
-        return 1;
+  // ---- import: desktop save folders, single files, .zip, our .json export ----
+  var JUNK_FILE = /^(desktop\.ini|thumbs\.db|\.ds_store|__macosx)$/i;
+  var SAVE_FILE = /\.(rpgsave|rmmzsave)$/i;
+  var MAX_IMPORT = 200 * 1024 * 1024;
+
+  /** Where the desktop build keeps saves, in words a player can follow. */
+  function desktopSaveHint() {
+    var dir = saveDir().replace(/\/+$/, '');
+    var rel = gameRel(dir);
+    if (rel !== null) {
+      var win = (rel || '.').replace(/\//g, '\\');
+      // MV desktop exports keep the game in www\, MZ next to Game.exe.
+      return CFG.engine === 'mv'
+        ? { where: 'game', path: 'www\\' + win, alt: win }
+        : { where: 'game', path: win };
+    }
+    var w = dir.replace(/^\//, '').replace(/\//g, '\\');
+    w = w.replace(/^c:\\users\\player\\appdata\\local(?=\\|$)/i, '%LOCALAPPDATA%')
+      .replace(/^c:\\users\\player\\appdata\\roaming(?=\\|$)/i, '%APPDATA%')
+      .replace(/^c:\\users\\player(?=\\|$)/i, '%USERPROFILE%');
+    return { where: 'user', path: w };
+  }
+
+  // Minimal zip reader (stored + deflate) on DecompressionStream.
+  function inflateRaw(bytes) {
+    if (typeof DecompressionStream === 'undefined') return Promise.reject(new Error('this browser cannot open .zip files; unzip it first'));
+    var ds = new DecompressionStream('deflate-raw');
+    var out = new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();
+    return out.then(function (b) { return new Uint8Array(b); });
+  }
+  function unzip(buf) {
+    var u8 = new Uint8Array(buf), dv = new DataView(buf);
+    var eocd = -1;
+    for (var i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    if (eocd < 0) return Promise.reject(new Error('not a valid .zip file'));
+    var count = dv.getUint16(eocd + 10, true), p = dv.getUint32(eocd + 16, true);
+    var jobs = [], total = 0;
+    for (var n = 0; n < count; n++) {
+      if (dv.getUint32(p, true) !== 0x02014b50) break;
+      var method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true), usize = dv.getUint32(p + 24, true);
+      var nl = dv.getUint16(p + 28, true), el = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true), lho = dv.getUint32(p + 42, true);
+      var name = td.decode(u8.subarray(p + 46, p + 46 + nl)).replace(/\\/g, '/');
+      p += 46 + nl + el + cl;
+      if (/\/$/.test(name)) continue;
+      total += usize;
+      if (total > MAX_IMPORT) return Promise.reject(new Error('the .zip is too large'));
+      var start = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true);
+      var raw = u8.subarray(start, start + csize);
+      jobs.push((function (name, method, raw) {
+        var data = method === 0 ? Promise.resolve(raw.slice()) : method === 8 ? inflateRaw(raw) : Promise.reject(new Error(name + ': unsupported zip compression'));
+        return data.then(function (d) { return { path: name, data: d }; });
+      })(name, method, raw));
+    }
+    return Promise.all(jobs);
+  }
+
+  /** Flatten picked/dropped files (and folders, and zips) into {path, data}. */
+  function readPicked(list) {
+    var total = 0;
+    return Promise.all(list.map(function (it) {
+      total += it.file.size;
+      if (total > MAX_IMPORT) return Promise.reject(new Error('that is more than 200 MB, is it really a save folder?'));
+      return it.file.arrayBuffer().then(function (buf) {
+        if (/\.zip$/i.test(it.path)) return unzip(buf);
+        return [{ path: it.path, data: new Uint8Array(buf) }];
       });
+    })).then(function (groups) { return [].concat.apply([], groups); });
+  }
+  function fromFileList(files) {
+    return Array.from(files).map(function (f) { return { path: f.webkitRelativePath || f.name, file: f }; });
+  }
+  function fromDataTransfer(dt) {
+    var items = Array.from(dt.items || []).map(function (i) { return i.webkitGetAsEntry && i.webkitGetAsEntry(); }).filter(Boolean);
+    if (!items.length) return Promise.resolve(fromFileList(dt.files || []));
+    var out = [];
+    var walk = function (entry, prefix) {
+      if (entry.isFile) return new Promise(function (res, rej) { entry.file(function (f) { out.push({ path: prefix + f.name, file: f }); res(); }, rej); });
+      return new Promise(function (res, rej) {
+        var reader = entry.createReader(), all = [];
+        var next = function () {
+          reader.readEntries(function (batch) {
+            if (!batch.length) { Promise.all(all.map(function (e) { return walk(e, prefix + entry.name + '/'); })).then(res, rej); return; }
+            all = all.concat(Array.from(batch)); next();
+          }, rej);
+        };
+        next();
+      });
+    };
+    return Promise.all(items.map(function (e) { return walk(e, ''); })).then(function () { return out; });
+  }
+
+  /**
+   * Decide what to import. Our .json exports restore everything. Otherwise
+   * take the folder holding the save files (*.rpgsave / *.rmmzsave), with
+   * everything else in it (plugins keep extra files there), and copy it into
+   * the folder the game saves to here.
+   */
+  function planImport(entries) {
+    entries = entries.filter(function (e) { var b = e.path.split('/').pop(); return b && !JUNK_FILE.test(b) && e.path.split('/').indexOf('__MACOSX') < 0; });
+    var jsons = entries.filter(function (e) { return /\.json$/i.test(e.path); });
+    var exports = [], exportEntries = [];
+    jsons.forEach(function (e) {
+      try {
+        var d = JSON.parse(td.decode(e.data));
+        if (d && d.format === 'rpgm-web-saves' && d.entries) { exports.push(d); exportEntries.push(e); }
+      } catch (err) { /* not ours */ }
     });
-    return Promise.all(tasks).then(function (n) { flush(); return n.reduce(function (a, b) { return a + b; }, 0); });
+    var dirOf = function (p) { var i = p.lastIndexOf('/'); return i < 0 ? '' : p.slice(0, i); };
+    var counts = {};
+    entries.forEach(function (e) { if (SAVE_FILE.test(e.path)) counts[dirOf(e.path)] = (counts[dirOf(e.path)] || 0) + 1; });
+    var best = null;
+    Object.keys(counts).forEach(function (d) { if (best === null || counts[d] > counts[best]) best = d; });
+    var files = best === null ? [] : entries.filter(function (e) { return dirOf(e.path) === best && exportEntries.indexOf(e) < 0; });
+    files = files.map(function (e) { return { name: e.path.split('/').pop(), data: e.data }; });
+    return { exports: exports, files: files };
+  }
+
+  function applyImport(plan) {
+    var n = 0;
+    plan.exports.forEach(function (d) { Object.keys(d.entries).forEach(function (k) { kvSet(k, decodeValue(d.entries[k])); n++; }); });
+    if (plan.files.length) {
+      var dir = saveDir().replace(/\/+$/, '');
+      if (!fsMod.existsSync(dir)) fsMod.mkdirSync(dir, { recursive: true });
+      plan.files.forEach(function (f) { fsMod.writeFileSync(dir + '/' + f.name, f.data); n++; });
+    }
+    flush();
+    return n;
+  }
+
+  /** Full flow for picked or dropped items. Resolves to a message for the player. */
+  function importFrom(listPromise) {
+    return Promise.resolve(listPromise).then(readPicked).then(function (entries) {
+      var plan = planImport(entries);
+      if (!plan.exports.length && !plan.files.length) {
+        throw new Error('No saves found. Pick the files from the game\u2019s save folder (they end in .' + (CFG.engine === 'mz' ? 'rmmzsave' : 'rpgsave') + '), the folder itself, or a .zip of it.');
+      }
+      if (plan.files.length) {
+        var dir = saveDir().replace(/\/+$/, '');
+        // Ask only when real save slots would be replaced (not config/global).
+        var clash = plan.files.filter(function (f) { return !/^(config|global)\./i.test(f.name) && fsMod.existsSync(dir + '/' + f.name); }).length;
+        if (clash && !window.confirm('Replace ' + clash + ' save' + (clash === 1 ? '' : 's') + ' in this browser with the ones from your computer?')) return null;
+        var hasGlobal = plan.files.some(function (f) { return /^global\./i.test(f.name); }) || fsMod.existsSync(dir + '/global.' + (CFG.engine === 'mz' ? 'rmmzsave' : 'rpgsave'));
+        var n = applyImport(plan);
+        return 'Imported ' + n + ' file' + (n === 1 ? '' : 's') + (hasGlobal ? '' : '. global.' + (CFG.engine === 'mz' ? 'rmmzsave' : 'rpgsave') + ' was missing, so the save list may look empty; import the whole folder') + ' \u2014 reloading\u2026';
+      }
+      var m = applyImport(plan);
+      return 'Restored ' + m + ' save entr' + (m === 1 ? 'y' : 'ies') + ' \u2014 reloading\u2026';
+    });
+  }
+  // Older callers (tests, R API): a FileList or array of File.
+  function importSaveFiles(files) {
+    return readPicked(fromFileList(files)).then(function (entries) { return applyImport(planImport(entries)); });
   }
   R.exportSaves = exportSaves;
   R.importSaveFiles = importSaveFiles;
+  R.importFrom = importFrom;
+  R.fromDataTransfer = fromDataTransfer;
+  R.desktopSaveHint = desktopSaveHint;
 
   // ---------------------------------------------------------------------------
   // Overlay
@@ -1085,6 +1221,19 @@
       '.title{padding:8px 12px 6px;color:#aaa;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}' +
       '.toast{position:fixed;bottom:calc(20px + env(safe-area-inset-bottom,0px));left:50%;transform:translateX(-50%);background:rgba(24,24,28,.94);color:#eee;padding:10px 16px;border-radius:8px;font:14px system-ui,sans-serif;pointer-events:none}' +
       'input{display:none}' +
+      '.panel{pointer-events:auto;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:min(440px,calc(100vw - 24px));max-height:calc(100vh - 24px);overflow-y:auto;box-sizing:border-box;' +
+      'background:rgba(24,24,28,.97);color:#eee;border-radius:12px;padding:20px 20px 16px;font:14px/1.45 system-ui,sans-serif;box-shadow:0 12px 40px rgba(0,0,0,.6)}' +
+      '.panel[hidden],.drop[hidden]{display:none}' +
+      '.panel h2{margin:0 28px 6px 0;font-size:17px;font-weight:650}.panel p{margin:0 0 10px;color:#c8c8d0}.panel ol{margin:0 0 14px;padding-left:20px}.panel li{margin:4px 0}' +
+      '.panel code{display:block;margin:6px 0 2px;padding:7px 9px;background:rgba(255,255,255,.08);border-radius:6px;font:13px ui-monospace,Menlo,Consolas,monospace;word-break:break-all;user-select:all;-webkit-user-select:all}' +
+      '.panel .alt{color:#9a9aa6;font-size:12px}' +
+      '.panel .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}' +
+      '.panel .row button{flex:1 1 140px;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font:inherit;cursor:pointer}' +
+      '.panel .row button.primary{background:#f0a35e;border-color:#f0a35e;color:#2a1708;font-weight:650}' +
+      '.panel .row button:hover{filter:brightness(1.1)}' +
+      '.panel .note{font-size:12.5px;color:#9a9aa6;margin:0}' +
+      '.panel .x{position:absolute;top:10px;right:10px;width:30px;height:30px;border:0;border-radius:15px;background:none;color:#bbb;font-size:20px;line-height:1;cursor:pointer}.panel .x:hover{background:rgba(255,255,255,.1);color:#fff}' +
+      '.drop{pointer-events:none;position:fixed;inset:12px;border:3px dashed rgba(240,163,94,.9);border-radius:16px;background:rgba(13,11,18,.78);color:#fff;display:grid;place-items:center;font:600 18px system-ui,sans-serif;text-align:center;padding:20px}' +
       '</style>' +
       '<button class="btn" part="btn" aria-label="Menu" title="Menu"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg></button>' +
       '<div class="menu" hidden role="menu">' +
@@ -1092,13 +1241,27 @@
       '<button data-a="fullscreen">Fullscreen</button>' +
       '<button data-a="mute"></button>' +
       '<hr><button data-a="export">Export saves</button>' +
-      '<label>Import saves…<input type="file" multiple accept=".json,.rpgsave,.rmmzsave"></label>' +
+      '<button data-a="import">Import saves…</button>' +
       (EMBED
         ? '<hr><button data-a="newtab">Open in new tab</button><button data-a="library">Exit game</button>'
         : '<hr><button data-a="library">Back to library</button>') +
-      '</div>';
+      '</div>' +
+      '<div class="panel" hidden role="dialog" aria-modal="true" aria-labelledby="imp-h">' +
+      '<h2 id="imp-h">Import saves</h2>' +
+      '<p>Continue where you left off in the desktop version of the game.</p>' +
+      '<ol><li>On your computer, open the game\u2019s save folder:<code class="path"></code><span class="alt"></span></li>' +
+      '<li>Choose that folder, or select all the files in it.</li></ol>' +
+      '<div class="row"><button data-p="folder" class="primary">Choose folder</button><button data-p="files">Choose files</button></div>' +
+      '<p class="note">You can also drop the folder, or a .zip of it, onto the game. Files from <b>Export saves</b> (.json) work too.</p>' +
+      '<button class="x" data-p="close" aria-label="Close">\u00d7</button>' +
+      '</div>' +
+      '<div class="drop" hidden>Drop your save folder here to import it</div>' +
+      '<input type="file" class="in-files" multiple>' +
+      '<input type="file" class="in-folder" webkitdirectory multiple>';
     document.body.appendChild(host);
-    var btn = root.querySelector('.btn'), menu = root.querySelector('.menu'), input = root.querySelector('input');
+    var btn = root.querySelector('.btn'), menu = root.querySelector('.menu');
+    var panel = root.querySelector('.panel'), drop = root.querySelector('.drop');
+    var inFiles = root.querySelector('.in-files'), inFolder = root.querySelector('.in-folder');
     root.querySelector('.title').textContent = CFG.title || '';
     var muteBtn = root.querySelector('[data-a=mute]');
     var setMuteLabel = function () { muteBtn.textContent = muted ? 'Sound: off' : 'Sound: on'; };
@@ -1127,18 +1290,55 @@
         R.applyMute && R.applyMute();
         setMuteLabel();
       } else if (a === 'export') { exportSaves(); toast('Saves exported'); }
+      else if (a === 'import') openImport();
       else if (a === 'library') backToLibrary();
       else if (a === 'newtab') openInNewTab();
       menu.hidden = true;
     });
-    input.addEventListener('change', function () {
-      if (!input.files.length) return;
-      importSaveFiles(input.files).then(function (n) {
-        toast('Imported ' + n + ' save entr' + (n === 1 ? 'y' : 'ies') + ' — reloading…');
-        setTimeout(function () { location.reload(); }, 1200);
-      }, function (err) { toast(err.message); });
-      input.value = '';
-      menu.hidden = true;
+    // ---- import panel ----
+    var runImport = function (p) {
+      importFrom(p).then(function (msg) {
+        if (!msg) return;
+        panel.hidden = true;
+        toast(msg, 3000);
+        setTimeout(function () { location.reload(); }, 1600);
+      }, function (err) { toast(err.message || String(err), 7000); });
+    };
+    function openImport() {
+      var h = desktopSaveHint();
+      root.querySelector('.path').textContent = (h.where === 'game' ? '<game folder>\\' : '') + h.path;
+      root.querySelector('.alt').textContent = h.alt ? 'or <game folder>\\' + h.alt : h.where === 'user' ? 'Paste it into the File Explorer address bar.' : '';
+      if (!('webkitdirectory' in inFolder) || matchMedia('(pointer: coarse)').matches) root.querySelector('[data-p=folder]').hidden = true;
+      panel.hidden = false;
+      var first = panel.querySelector('.row button:not([hidden])');
+      if (first) first.focus();
+    }
+    panel.addEventListener('click', function (e) {
+      var a = e.target.closest && e.target.closest('[data-p]');
+      a = a && a.getAttribute('data-p');
+      if (a === 'close') panel.hidden = true;
+      else if (a === 'files') inFiles.click();
+      else if (a === 'folder') inFolder.click();
+    });
+    // Keys typed in the panel must not drive the game (Esc closes it).
+    ['keydown', 'keyup'].forEach(function (t) {
+      panel.addEventListener(t, function (e) { e.stopPropagation(); if (t === 'keydown' && e.key === 'Escape') panel.hidden = true; });
+    });
+    [inFiles, inFolder].forEach(function (inp) {
+      inp.addEventListener('change', function () {
+        if (inp.files.length) runImport(fromFileList(inp.files));
+        inp.value = '';
+      });
+    });
+    // Drag a save folder (or files, or a .zip) onto the game.
+    var hasFiles = function (e) { return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0; };
+    origAdd.call(window, 'dragover', function (e) { if (!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; drop.hidden = false; });
+    origAdd.call(window, 'dragleave', function (e) { if (!e.relatedTarget) drop.hidden = true; });
+    origAdd.call(window, 'drop', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      drop.hidden = true;
+      runImport(fromDataTransfer(e.dataTransfer));
     });
     // Close the menu when the game is clicked.
     origAdd.call(window, 'pointerdown', function (e) {
