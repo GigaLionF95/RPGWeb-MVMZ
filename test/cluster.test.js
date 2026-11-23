@@ -152,3 +152,26 @@ test('nginx-snippet prints internal locations with the game headers', async () =
   assert.match(out, /__rpgm_files_br\/[\s\S]*Content-Encoding br/);
   assert.match(out, /proxy_pass http:\/\/\$rpgm_node\$request_uri;/);
 });
+
+test('copied files keep the exact millisecond mtime', async () => {
+  const { copyGame, createSyncSource, localSource } = await import('../src/sync.js');
+  const work = await tmpdir();
+  const a = new Library(path.join(work, 'a'));
+  const b = new Library(path.join(work, 'b'));
+  await addGame(a, work, 'ms', 1000);
+  // Times that floating-point seconds can't hold exactly.
+  let i = 0;
+  for (const [p] of (await a.get('ms')).files) {
+    const t = (1763870000000 + 89 + (i++ % 7) * 101) / 1000 + 0.000867;
+    await fs.promises.utimes(path.join(a.rootDir('ms'), p), t, t);
+  }
+  const src = createSyncSource(a);
+  await fs.promises.mkdir(b.gameDir('ms'), { recursive: true });
+  const fake = { name: 'a', list: (id, part) => localSource(a, src).list(id, part), fetch: (id, rel, dst) => fs.promises.copyFile(path.join(a.gameDir(id), rel), dst) };
+  await copyGame(b, 'ms', { catalogFrom: fake, dataFrom: fake });
+  for (const [p] of (await a.get('ms')).files) {
+    const x = Math.floor(fs.statSync(path.join(a.rootDir('ms'), p)).mtimeMs);
+    const y = Math.floor(fs.statSync(path.join(b.rootDir('ms'), p)).mtimeMs);
+    assert.equal(y, x, p);
+  }
+});

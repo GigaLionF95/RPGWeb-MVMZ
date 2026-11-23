@@ -152,7 +152,8 @@ export async function copyGame(lib, id, { catalogFrom, dataFrom, concurrency = 4
         await fsp.mkdir(path.dirname(dst), { recursive: true });
         const old = path.join(dir, clean);
         let reuse = false;
-        try { const st = await fsp.stat(old); reuse = st.size === size && Math.floor(st.mtimeMs) === mtime; } catch { /* new file */ }
+        // ±1 ms: copies made before the utimes fix below are 1 ms early.
+        try { const st = await fsp.stat(old); reuse = st.size === size && Math.abs(Math.floor(st.mtimeMs) - mtime) <= 1; } catch { /* new file */ }
         if (reuse) {
           try { await fsp.link(old, dst); } catch { await fsp.copyFile(old, dst); }
           linked++;
@@ -162,7 +163,10 @@ export async function copyGame(lib, id, { catalogFrom, dataFrom, concurrency = 4
           if (st.size !== size) throw new Error(`${clean}: got ${st.size} bytes, expected ${size}`);
           fetched++; bytes += size;
         }
-        const t = new Date(mtime);
+        // utimes takes float seconds: x.089 can land on x.088999 and read
+        // back 1 ms early. Half a millisecond up keeps floor() exact, so
+        // ETags and precompressed copies match the source on every server.
+        const t = (mtime + 0.5) / 1000;
         await fsp.utimes(dst, t, t);
       }
     };
