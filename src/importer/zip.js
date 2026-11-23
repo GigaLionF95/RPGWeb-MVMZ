@@ -5,7 +5,9 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
+import { Transform } from 'node:stream';
 import { decodeName } from './names.js';
+import { MAX_META_BYTES } from './limits.js';
 
 const SIG_EOCD = 0x06054b50;
 const SIG_EOCD64 = 0x06064b50;
@@ -157,23 +159,45 @@ export class ZipArchive {
     throw new Error(`unsupported zip compression method ${entry.method} (${entry.name})`);
   }
 
-  async read(entry) {
+  /** Whole entry in memory; only for small metadata files. */
+  async read(entry, maxBytes = MAX_META_BYTES) {
     const chunks = [];
-    for await (const c of await this.stream(entry)) chunks.push(c);
+    let n = 0;
+    for await (const c of await this.stream(entry)) {
+      n += c.length;
+      if (n > maxBytes || n > entry.usize) throw new Error(`zip entry ${entry.name} is larger than declared`);
+      chunks.push(c);
+    }
     return Buffer.concat(chunks);
   }
 
-  /** Extract every entry into dest. onProgress(doneBytes, totalBytes). */
-  async extractAll(dest, { filter, onProgress } = {}) {
-    const total = this.entries.reduce((s, e) => s + (e.isDir ? 0 : e.usize), 0);
+  /**
+   * Extract every entry into dest. onProgress(doneBytes, totalBytes).
+   * `budget` (UnpackBudget) caps total bytes/files; an entry that inflates past
+   * its declared size is rejected, so a lying header cannot bypass the cap.
+   */
+  async extractAll(dest, { filter, onProgress, budget } = {}) {
+    const files = this.entries.filter((e) => !e.isDir);
+    const total = files.reduce((s, e) => s + e.usize, 0);
+    budget?.check(total, files.length);
     let done = 0;
     for (const e of this.entries) {
       const rel = safeRelative(e.name);
       if (!rel || (filter && !filter(rel, e))) continue;
       const out = path.join(dest, rel);
       if (e.isDir) { await fsp.mkdir(out, { recursive: true }); continue; }
+      budget?.file();
       await fsp.mkdir(path.dirname(out), { recursive: true });
-      await pipeline(await this.stream(e), fs.createWriteStream(out));
+      let n = 0;
+      const guard = new Transform({
+        transform(chunk, _enc, cb) {
+          n += chunk.length;
+          if (n > e.usize) return cb(new Error(`zip entry ${e.name} inflates past its declared size`));
+          try { budget?.add(chunk.length); } catch (err) { return cb(err); }
+          cb(null, chunk);
+        },
+      });
+      await pipeline(await this.stream(e), guard, fs.createWriteStream(out));
       done += e.usize;
       onProgress?.(done, total);
     }

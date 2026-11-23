@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { safeRelative } from './zip.js';
+import { MAX_META_BYTES } from './limits.js';
 
 function parseOctal(buf) {
   if (buf[0] & 0x80) { // GNU base-256 for large sizes
@@ -49,7 +50,7 @@ const finish = (ws) => new Promise((res, rej) => { ws.once('error', rej); ws.end
  * drive letters, "..") so archives produced on Windows extract correctly.
  * Returns the list of extracted relative file paths.
  */
-export async function extractTar(stream, dest, { onFile } = {}) {
+export async function extractTar(stream, dest, { onFile, budget } = {}) {
   let buf = Buffer.alloc(0);
   let pax = {};
   let longName = null;
@@ -76,6 +77,7 @@ export async function extractTar(stream, dest, { onFile } = {}) {
     padLeft = (512 - (realSize % 512)) % 512;
 
     if (type === 'x' || type === 'g' || type === 'L') {
+      if (realSize > MAX_META_BYTES) throw new Error('tar header record is too large');
       sink = { kind: 'meta', type, chunks: [] };
       return;
     }
@@ -86,6 +88,7 @@ export async function extractTar(stream, dest, { onFile } = {}) {
       return;
     }
     if ((type === '0' || type === '\0' || type === '7') && rel) {
+      budget?.file();
       const out = path.join(dest, rel);
       await fsp.mkdir(path.dirname(out), { recursive: true });
       sink = { kind: 'file', rel, size: realSize, ws: fs.createWriteStream(out) };
@@ -116,7 +119,7 @@ export async function extractTar(stream, dest, { onFile } = {}) {
           const part = buf.subarray(0, take);
           buf = buf.subarray(take);
           dataLeft -= take;
-          if (sink.kind === 'file') await write(sink.ws, part);
+          if (sink.kind === 'file') { budget?.add(take); await write(sink.ws, part); }
           else if (sink.kind === 'meta') sink.chunks.push(Buffer.from(part));
           if (dataLeft > 0) return;
         }

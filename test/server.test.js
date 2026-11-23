@@ -130,3 +130,20 @@ test('API-only mode hides the library but keeps games, embeds and the SDK', asyn
     assert.equal(info.headers.get('access-control-allow-origin'), '*');
   } finally { api.close(); }
 });
+
+test('uploads are imported one at a time', async () => {
+  const auth = { Authorization: `Bearer ${TOKEN}` };
+  const zips = await Promise.all(['q1', 'q2', 'q3'].map(async (n) => buildZip(await readTree(await makeGame(path.join(work, n), 'mz', { title: n })))));
+  const ids = await Promise.all(zips.map(async (zip, i) => {
+    const r = await fetch(`${base}/api/games?filename=q.zip&id=queue-${i}`, { method: 'POST', headers: auth, body: zip });
+    return (await r.json()).job;
+  }));
+  let maxActive = 0;
+  for (;;) {
+    const js = await Promise.all(ids.map(async (id) => (await fetch(`${base}/api/jobs/${id}`, { headers: auth })).json()));
+    maxActive = Math.max(maxActive, js.filter((j) => j.status === 'running' && j.phase !== 'queued').length);
+    if (js.every((j) => j.status !== 'running')) { assert.ok(js.every((j) => j.status === 'done'), JSON.stringify(js.map((j) => j.error))); break; }
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  assert.equal(maxActive <= 1, true);
+});

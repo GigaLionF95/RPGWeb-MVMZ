@@ -75,7 +75,9 @@ export async function precompressTree(root, files, outDir, { onProgress, log, co
   const entries = {};
   const total = { files: 0, bytes: 0, br: 0, gzip: 0 };
   let done = 0;
-  const limit = concurrency || Math.max(1, Math.min(4, os.availableParallelism?.() || os.cpus().length));
+  // Default leaves a core for serving; the CLI passes more when run offline.
+  const cpus = os.availableParallelism?.() || os.cpus().length;
+  const limit = concurrency || Math.max(1, Math.min(2, cpus - 1));
   onProgress?.(0, jobs.length);
   await pool(jobs, limit, async ([rel]) => {
     const src = path.join(root, rel);
@@ -83,10 +85,10 @@ export async function precompressTree(root, files, outDir, { onProgress, log, co
     let buf = await fsp.readFile(src);
     const hook = hookFor(rel);
     if (hook) buf = patchScript(buf, hook);
-    const [br, gz] = await Promise.all([
-      compressAsync(buf, 'br', buf.length > BIG ? 9 : 11),
-      compressAsync(buf, 'gzip', 9),
-    ]);
+    // One thread-pool task at a time per worker, so the server keeps
+    // threads free for reading game files while an import runs.
+    const br = await compressAsync(buf, 'br', buf.length > BIG ? 9 : 11);
+    const gz = await compressAsync(buf, 'gzip', 9);
     const entry = { size: st.size, mtime: Math.floor(st.mtimeMs) };
     if (hook) entry.patch = patchId(hook);
     for (const [enc, out] of [['br', br], ['gzip', gz]]) {

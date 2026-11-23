@@ -107,7 +107,7 @@ function renderGames(games) {
     const tag = document.createElement('span');
     tag.className = 'tag';
     tag.textContent = `${g.engine.toUpperCase()}${g.engineVersion ? ' ' + g.engineVersion : ''}`;
-    meta.append(tag, ` · ${fmtBytes(g.totalBytes)} · ${num.format(g.fileCount)} files${g.hidden ? ' · hidden' : ''}`);
+    meta.append(tag, ` · ${fmtBytes(g.totalBytes)} · ${num.format(g.fileCount)} files${g.hidden ? ' · unlisted' : ''}`);
     const play = li.querySelector('.play');
     play.href = g.url;
     play.setAttribute('aria-label', `Play ${g.title}`);
@@ -115,7 +115,8 @@ function renderGames(games) {
     adm.hidden = !admin;
     const hideBtn = li.querySelector('[data-act=hide]');
     hideBtn.classList.toggle('on', !!g.hidden);
-    hideBtn.setAttribute('aria-label', g.hidden ? 'Show in library' : 'Hide from library');
+    hideBtn.title = g.hidden ? 'Show in the library' : 'Unlist: hide from the library, the link keeps working';
+    hideBtn.setAttribute('aria-label', hideBtn.title);
     hideBtn.querySelector('use').setAttribute('href', g.hidden ? '#i-eye-off' : '#i-eye');
     list.append(li);
   }

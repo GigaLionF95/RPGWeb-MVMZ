@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { ZipArchive } from './zip.js';
 import { extractTar } from './tar.js';
@@ -12,6 +13,7 @@ import { analyzeGame, listFiles } from './analyze.js';
 import { findFfmpeg, planTranscodes, runTranscodes } from './transcode.js';
 import { ID_RE } from '../library.js';
 import { precompressTree, precompressGame } from '../precompress.js';
+import { UnpackBudget } from './limits.js';
 
 const JUNK = new Set(['desktop.ini', 'thumbs.db', '.ds_store']);
 
@@ -25,22 +27,12 @@ function hasBsdtar() {
   return null;
 }
 
-function runTool(bin, args) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let err = '';
-    p.stderr.on('data', (d) => { err = (err + d).slice(-2000); });
-    p.on('error', reject);
-    p.on('close', (c) => (c === 0 ? resolve() : reject(new Error(`${bin} failed: ${err.trim()}`))));
-  });
-}
-
-async function extractArchive(file, dest, progress, log) {
+async function extractArchive(file, dest, progress, log, budget) {
   const lower = file.toLowerCase();
   if (await ZipArchive.isZip(file)) {
     const z = await ZipArchive.open(file);
     try {
-      await z.extractAll(dest, { onProgress: (d, t) => progress('extract', d, t) });
+      await z.extractAll(dest, { budget, onProgress: (d, t) => progress('extract', d, t) });
     } finally { await z.close(); }
     return;
   }
@@ -50,16 +42,39 @@ async function extractArchive(file, dest, progress, log) {
     : undefined;
   if (tarDecomp !== undefined) {
     const src = fs.createReadStream(file);
-    await extractTar(tarDecomp ? src.pipe(tarDecomp) : src, dest);
+    await extractTar(tarDecomp ? src.pipe(tarDecomp) : src, dest, { budget });
     return;
   }
   const bsdtar = hasBsdtar();
   if (bsdtar) {
     log?.('extracting with bsdtar');
-    await runTool(bsdtar, ['-xf', file, '-C', dest]);
+    await bsdtarToTar(bsdtar, file, dest, budget);
     return;
   }
   throw new Error('Unsupported archive format. Use .zip or .tar(.gz), or install bsdtar (libarchive) for 7z/rar.');
+}
+
+/**
+ * 7z/rar/etc. through libarchive, without letting it write to disk: bsdtar
+ * re-packs the archive as a tar stream (`@archive`), and our own extractor
+ * writes the files, with the same path checks and size limits as zip/tar.
+ * Links and device entries are dropped on the way.
+ */
+async function bsdtarToTar(bin, file, dest, budget) {
+  const child = spawn(bin, ['-c', '-f', '-', '--format', 'pax', '@' + path.resolve(file)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  try { os.setPriority(child.pid, 10); } catch { /* best effort */ }
+  let err = '';
+  child.stderr.on('data', (d) => { err = (err + d).slice(-2000); });
+  const exited = new Promise((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+  try {
+    await extractTar(child.stdout, dest, { budget });
+  } catch (e) {
+    child.kill('SIGKILL');
+    await exited.catch(() => {});
+    throw e;
+  }
+  const code = await exited;
+  if (code !== 0) throw new Error(`${bin} could not read the archive: ${err.trim() || 'exit ' + code}`);
 }
 
 async function removeJunk(root) {
@@ -84,7 +99,7 @@ export async function refreshGame(lib, id, opts = {}) {
   for (const k of keep) if (g.meta[k] !== undefined) meta[k] = g.meta[k];
   await fsp.writeFile(path.join(lib.gameDir(id), 'files.json'), JSON.stringify(files));
   await lib.writeMeta(id, meta);
-  if (opts.precompress !== false) await precompressGame(lib, id, { log: opts.log });
+  if (opts.precompress !== false) await precompressGame(lib, id, { log: opts.log, concurrency: opts.threads });
   return meta;
 }
 
@@ -93,12 +108,13 @@ export async function refreshGame(lib, id, opts = {}) {
  * @param {string} source  path to an archive or folder
  * @param {{id?:string,title?:string,transcode?:'auto'|'off'|'audio'|'video'|'all',
  *          onProgress?:Function, log?:Function, keepSource?:boolean,
- *          precompress?:boolean}} opts
+ *          precompress?:boolean, limits?:{maxBytes?:number,maxFiles?:number}}} opts
  */
 export async function importGame(lib, source, opts = {}) {
   const log = opts.log || (() => {});
   const progress = (phase, done, total, message) => opts.onProgress?.({ phase, done, total, message });
   const st = await fsp.stat(source);
+  const budget = new UnpackBudget(opts.limits);
   const work = path.join(lib.tmpDir, 'import-' + crypto.randomBytes(6).toString('hex'));
   await fsp.mkdir(work, { recursive: true });
   try {
@@ -108,12 +124,12 @@ export async function importGame(lib, source, opts = {}) {
       await fsp.mkdir(base);
       progress('extract', 0, 1, 'Extracting archive');
       log(`extracting ${path.basename(source)}`);
-      await extractArchive(source, base, progress, log);
+      await extractArchive(source, base, progress, log, budget);
     }
     progress('locate', 0, 1, 'Looking for the game');
     const scratch = path.join(work, 'unwrap');
     await fsp.mkdir(scratch);
-    const { root, packaging } = await locateGame(base, scratch, { log });
+    const { root, packaging } = await locateGame(base, scratch, { log, budget });
     log(`game root: ${path.relative(base, root) || '.'} (${packaging})`);
 
     // Stage a private copy we can modify (move when we own it).
@@ -171,7 +187,7 @@ export async function importGame(lib, source, opts = {}) {
     if (opts.precompress !== false) {
       preDir = path.join(work, 'pre');
       await precompressTree(staged, files, preDir, {
-        log, onProgress: (d, t) => progress('precompress', d, t, 'Compressing text files'),
+        log, concurrency: opts.threads, onProgress: (d, t) => progress('precompress', d, t, 'Compressing text files'),
       });
     }
     progress('install', 0, 1, 'Installing');

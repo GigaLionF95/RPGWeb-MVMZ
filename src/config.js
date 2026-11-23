@@ -27,6 +27,13 @@ export function loadConfig(flags = {}) {
     // CSP frame-ancestors for embeds: '*' (anyone) or a space-separated list of origins
     frameAncestors: process.env.RPGM_FRAME_ANCESTORS || saved.frameAncestors || '*',
     trustProxy: bool(process.env.RPGM_TRUST_PROXY, saved.trustProxy ?? false),
+    // Caps for unpacking uploaded archives (zip bombs and the like).
+    limits: {
+      maxBytes: Number(process.env.RPGM_MAX_UNPACKED_GB || saved.maxUnpackedGB || 20) * 1024 ** 3,
+      maxFiles: Number(process.env.RPGM_MAX_FILES || saved.maxFiles || 200000),
+    },
+    // Imports run one at a time by default so they never starve game serving.
+    importConcurrency: Math.max(1, Number(process.env.RPGM_IMPORT_CONCURRENCY || saved.importConcurrency || 1)),
     // Brotli/gzip copies of text files made at import (served with zero CPU).
     precompress: bool(process.env.RPGM_PRECOMPRESS, saved.precompress ?? true),
   };

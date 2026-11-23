@@ -15,10 +15,15 @@
  *         load: (game) => fetch('/api/saves/' + game, { credentials: 'include' })
  *                           .then((r) => (r.status === 404 ? null : r.json())),
  *         // `data` is a JSON-safe object; store it as-is for the signed-in user.
- *         save: (game, data) => fetch('/api/saves/' + game, {
- *           method: 'PUT', credentials: 'include',
- *           headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
- *         }),
+ *         save: (game, data, info) => {
+ *           const body = JSON.stringify(data);
+ *           return fetch('/api/saves/' + game, {
+ *             method: 'PUT', credentials: 'include',
+ *             headers: { 'Content-Type': 'application/json' }, body,
+ *             // finish even if the tab is closing (browsers cap keepalive at 64 KB)
+ *             keepalive: body.length < 60000,
+ *           });
+ *         },
  *       },
  *     });
  *   </script>
@@ -70,7 +75,10 @@
       } else if (d.type === 'save') {
         if (!saves || typeof saves.save !== 'function') return;
         // Keep writes in order; a newer snapshot always lands last.
-        queue = queue.then(function () { return saves.save(d.game, d.data); }).then(
+        // info.final: the game or this page is being hidden/closed; use a
+        // request that survives unload (fetch keepalive / sendBeacon).
+        var info = { seq: d.seq, final: !!d.final || document.visibilityState === 'hidden' };
+        queue = queue.then(function () { return saves.save(d.game, d.data, info); }).then(
           function () { reply({ type: 'saved', game: d.game, seq: d.seq, ok: true }); emit('saved', { game: d.game, seq: d.seq }); },
           function (err) { reply({ type: 'saved', game: d.game, seq: d.seq, ok: false, error: String((err && err.message) || err) }); emit('error', { game: d.game, stage: 'save', error: err }); }
         );

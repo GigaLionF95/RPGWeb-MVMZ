@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // rpgm-web CLI: serve | import | list | remove | info | token
+import '../src/env.js';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { Library } from '../src/library.js';
 import fs from 'node:fs';
+import os from 'node:os';
 import { importGame, refreshGame } from '../src/importer/index.js';
 import { loadConfig } from '../src/config.js';
 
@@ -23,7 +25,8 @@ Usage:
 
 Environment: RPGM_DATA, RPGM_PORT, RPGM_HOST, RPGM_ADMIN_TOKEN, RPGM_FFMPEG,
              RPGM_PUBLIC_LIBRARY (1/0), RPGM_MAX_UPLOAD_GB, RPGM_MODE=api,
-             RPGM_FRAME_ANCESTORS, RPGM_PRECOMPRESS (1/0)
+             RPGM_FRAME_ANCESTORS, RPGM_PRECOMPRESS (1/0), RPGM_MAX_UNPACKED_GB,
+             RPGM_MAX_FILES, RPGM_IMPORT_CONCURRENCY
 `;
 
 const { values: opt, positionals } = parseArgs({
@@ -70,6 +73,8 @@ try {
       const meta = await importGame(lib, path.resolve(args[0]), {
         id: opt.id, title: opt.title, transcode: opt.transcode,
         precompress: !opt['no-precompress'] && config.precompress,
+        limits: config.limits,
+        threads: Math.min(4, os.availableParallelism?.() || os.cpus().length),
         log: (m) => { if (lastLine) process.stderr.write('\n'); lastLine = ''; console.log('•', m); },
         onProgress: ({ phase, done, total, message }) => {
           if (!process.stderr.isTTY || !total || total <= 1) return;
@@ -105,6 +110,7 @@ try {
       for (const id of ids) {
         const m = await refreshGame(lib, id, {
           precompress: !opt['no-precompress'] && config.precompress,
+          threads: Math.min(4, os.availableParallelism?.() || os.cpus().length),
           log: (msg) => console.log('  •', msg),
         });
         console.log(`refreshed ${id}: ${m.engine.toUpperCase()} ${m.screen.width}x${m.screen.height}${m.titleArt ? ', title art ' + m.titleArt : ''}`);

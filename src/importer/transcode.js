@@ -19,6 +19,7 @@ export function findFfmpeg() {
 function run(bin, args) {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    try { os.setPriority(p.pid, 10); } catch { /* best effort: players first */ }
     let err = '';
     p.stderr.on('data', (d) => { err = (err + d).slice(-2000); });
     p.on('error', reject);

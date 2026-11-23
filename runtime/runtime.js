@@ -77,9 +77,11 @@
     mem.forEach(function (v, k) { entries[k] = encodeValue(v); });
     return { format: 'rpgm-web-saves', version: 1, game: GAME_ID, title: CFG.title, engine: CFG.engine, savedAt: new Date().toISOString(), entries: entries };
   }
-  function cloudPush() {
+  // `final`: the page is being hidden or closed, the host should send it now
+  // in a way that survives unload (fetch keepalive).
+  function cloudPush(final) {
     cloud.timer = null;
-    postParent({ type: 'save', seq: ++cloud.seq, data: cloudSnapshot() });
+    postParent({ type: 'save', seq: ++cloud.seq, final: !!final, data: cloudSnapshot() });
   }
   function cloudLoad() {
     return new Promise(function (resolve) {
@@ -103,7 +105,10 @@
       if (!dirty.size) return;
       dirty = new Map();
       if (cloud.timer) clearTimeout(cloud.timer);
-      cloud.timer = setTimeout(cloudPush, 800);
+      // Short debounce: one save touches a few keys within a few ms. Sending
+      // right away matters more than batching: a closing tab may never
+      // deliver a later message to the host page.
+      cloud.timer = setTimeout(cloudPush, 150);
       return;
     }
     if (!db || !dirty.size) return;
@@ -133,7 +138,7 @@
   }
   function flushNow() {
     flush();
-    if (cloud.active && cloud.timer) { clearTimeout(cloud.timer); cloudPush(); }
+    if (cloud.active && cloud.timer) { clearTimeout(cloud.timer); cloudPush(true); }
   }
   addEventListener('pagehide', flushNow);
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') flushNow(); });

@@ -116,10 +116,15 @@ Keep saves on your own backend, under your own accounts. Load the SDK from your 
       load: (game) => fetch('/api/saves/' + game, { credentials: 'include' })
         .then((r) => (r.status === 404 ? null : r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))),
       // `data` is a JSON-safe object: store it as-is for the signed-in user.
-      save: (game, data) => fetch('/api/saves/' + game, {
-        method: 'PUT', credentials: 'include',
-        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
-      }),
+      save: (game, data, info) => {
+        const body = JSON.stringify(data);
+        return fetch('/api/saves/' + game, {
+          method: 'PUT', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' }, body,
+          // Let the request finish if the tab is closing. Browsers cap keepalive bodies at 64 KB.
+          keepalive: body.length < 60000,
+        });
+      },
     },
     onEvent: (type, detail) => console.log('game event', type, detail), // hello, loaded, started, saved, exit, error
   });
@@ -131,7 +136,7 @@ Your backend needs two endpoints for the current user, for example `GET /api/sav
 How it works:
 1. The game frame (`?cloud=1`) asks your page for the player's saves over `postMessage` before the game boots.
 2. Your `load()` result becomes the game's storage. Nothing from the visitor's browser is mixed in, so two accounts on one computer never see each other's saves.
-3. After the game writes anything (a save slot, options, plugin data), it sends a full snapshot to your `save()`, debounced to ~1 s and flushed when the page is closed. Writes are delivered in order.
+3. After the game writes anything (a save slot, options, plugin data), it sends a full snapshot to your `save()` within ~150 ms. Writes are delivered in order. The third argument is `{ seq, final }`. `final` is true when the game or your page is being hidden or closed. Send that request with `keepalive` (or `navigator.sendBeacon`) so the browser does not cancel it. Save as soon as `save()` is called: a message sent while the tab is closing may never arrive.
 4. If `load()` throws or does not answer within 10 s (for example the visitor is not signed in), the game falls back to saving in the browser and shows a notice.
 
 Snapshot format (what `save()` receives and `load()` returns):
@@ -171,7 +176,7 @@ Write requests need `Authorization: Bearer <token>`.
 | `POST` | `/api/games?filename=game.zip[&id=…][&title=…]` | body is the archive; replies `202 {job}` |
 | `GET` | `/api/jobs/<job>` | import status: phase, progress, log |
 | `GET` | `/api/games/<id>` | game info, including `url`, `embedUrl`, `coverUrl`, `screen` |
-| `PATCH` | `/api/games/<id>` | `{"title": "…", "hidden": true}` |
+| `PATCH` | `/api/games/<id>` | `{"title": "…", "hidden": true}`. `hidden` means *unlisted*: the game leaves the public list, but `/play/<id>/`, `/embed/<id>/` and `GET /api/games/<id>` keep working for anyone with the link |
 | `DELETE` | `/api/games/<id>` | remove the game |
 | `GET` / `PUT` / `DELETE` | `/api/games/<id>/cover` | cover image (PUT body: PNG/JPEG/WebP, ≤ 10 MB) |
 | `GET` | `/play/<id>/` | play |
@@ -195,6 +200,9 @@ curl -H "Authorization: Bearer $TOKEN" --data-binary @game.zip \
 | `RPGM_FRAME_ANCESTORS` | `*` | sites allowed to embed games, space-separated |
 | `RPGM_MAX_UPLOAD_GB` | `8` | maximum archive upload size |
 | `RPGM_FFMPEG` | `ffmpeg` | path to ffmpeg |
+| `RPGM_MAX_UNPACKED_GB` | `20` | an archive that unpacks to more is rejected (zip bombs) |
+| `RPGM_MAX_FILES` | `200000` | maximum number of files in an archive |
+| `RPGM_IMPORT_CONCURRENCY` | `1` | imports running at once; the rest wait in a queue |
 | `RPGM_PRECOMPRESS` | `1` | `0`: skip making `.br`/`.gz` copies at import (compress on the fly only) |
 
 ## systemd
@@ -348,6 +356,18 @@ After that, each new map, battle or cutscene pulls only its own files. A game ca
 - Touch controls are built into the engine itself.
 - iPhone does not support the Fullscreen API for pages. To play fullscreen, open the game in Safari → Share → **Add to Home Screen**: rpgm-web serves a PWA manifest with landscape orientation.
 - Sound starts after the first tap (a browser requirement).
+
+## Security
+
+Only the admin can import games (token-protected API and CLI). The importer still treats every archive as hostile:
+
+- member paths are normalised: no `..`, no absolute paths, no drive letters, including inside nested NW.js and Halva packages;
+- symlinks, hard links and device entries are never created;
+- unpacking stops at `RPGM_MAX_UNPACKED_GB` / `RPGM_MAX_FILES` (zip, tar and Brotli bombs), and a zip entry that inflates past its declared size is rejected;
+- 7z/rar never touch the disk through bsdtar directly: bsdtar re-packs them into a tar stream, and rpgm-web's own extractor applies the same checks;
+- imports run one at a time with low CPU priority (ffmpeg, bsdtar), so a big upload does not slow down people who are playing.
+
+**Do not host games you do not trust.** A game is JavaScript, and it runs on the server's origin, like the library page. A malicious game could read the admin token from the library page's storage, or other games' browser saves. If strangers can submit games, review them before importing.
 
 ## Limitations
 

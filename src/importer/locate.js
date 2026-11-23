@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { ZipArchive } from './zip.js';
+import { ZipArchive, safeRelative } from './zip.js';
+import { MAX_META_BYTES } from './limits.js';
 import { extractTar } from './tar.js';
 
 const CORE_FILES = ['rpg_core.js', 'rmmz_core.js', 'main.js'];
@@ -50,11 +51,12 @@ async function findRoots(dir) {
 }
 
 async function readBrotliJson(file) {
-  return JSON.parse(zlib.brotliDecompressSync(await fsp.readFile(file)).toString('utf8'));
+  const raw = await fsp.readFile(file);
+  return JSON.parse(zlib.brotliDecompressSync(raw, { maxOutputLength: MAX_META_BYTES }).toString('utf8'));
 }
 
 /** Dragonhouse/Halva launcher: GameConfig.sbcf + GamePackages/*.halva2 (= brotli(tar)). */
-async function unpackHalva(configFile, out, log) {
+async function unpackHalva(configFile, out, log, budget) {
   const cfg = await readBrotliJson(configFile);
   if (cfg?.config?.halvaPassword) {
     throw new Error('This game uses password-protected Halva packages, which are not supported yet.');
@@ -63,9 +65,12 @@ async function unpackHalva(configFile, out, log) {
   const pkgs = [...(cfg.packageList?.baseContent || []), ...(cfg.packageList?.extraContent || [])];
   if (!pkgs.length) throw new Error('Halva GameConfig.sbcf lists no packages');
   for (const p of pkgs) {
-    const file = path.join(base, ...String(p.packageLocation).split(/[\\/]/));
+    // The config comes from the archive: keep package paths inside its folder.
+    const rel = safeRelative(String(p.packageLocation ?? ''));
+    if (!rel) throw new Error(`Halva package ${p.packageId} has an invalid location`);
+    const file = path.join(base, rel);
     log?.(`unpacking Halva package ${p.packageId} (${path.basename(file)})`);
-    await extractTar(fs.createReadStream(file).pipe(zlib.createBrotliDecompress()), out);
+    await extractTar(fs.createReadStream(file).pipe(zlib.createBrotliDecompress()), out, { budget });
   }
   return cfg;
 }
@@ -84,7 +89,7 @@ async function looksLikeEnigma(file) {
  * Returns { root, packaging } for the game inside dir, unwrapping as needed.
  * Unwrapped content is written to scratch (a directory we own).
  */
-export async function locateGame(dir, scratch, { log } = {}) {
+export async function locateGame(dir, scratch, { log, budget } = {}) {
   let roots = await findRoots(dir);
   if (roots.length) return { root: roots[0], packaging: 'folder' };
 
@@ -94,7 +99,7 @@ export async function locateGame(dir, scratch, { log } = {}) {
   if (halva.length) {
     const out = path.join(scratch, 'halva');
     await fsp.mkdir(out, { recursive: true });
-    await unpackHalva(halva[0], out, log);
+    await unpackHalva(halva[0], out, log, budget);
     roots = await findRoots(out);
     if (roots.length) return { root: roots[0], packaging: 'halva' };
   }
@@ -119,7 +124,7 @@ export async function locateGame(dir, scratch, { log } = {}) {
     const out = path.join(scratch, 'nw-' + path.basename(p).replace(/\W+/g, '_'));
     log?.(`unpacking NW.js package from ${path.basename(p)}`);
     const z = await ZipArchive.open(p);
-    try { await z.extractAll(out); } finally { await z.close(); }
+    try { await z.extractAll(out, { budget }); } finally { await z.close(); }
     roots = await findRoots(out);
     if (roots.length) return { root: roots[0], packaging: 'nwjs-package' };
   }

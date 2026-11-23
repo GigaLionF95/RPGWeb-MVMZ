@@ -43,6 +43,19 @@ class Lru {
   }
 }
 
+/** Counting semaphore; a released slot is handed straight to the next waiter. */
+class Slots {
+  constructor(n) { this.free = n; this.waiting = []; }
+  acquire() {
+    if (this.free > 0) { this.free--; return Promise.resolve(); }
+    return new Promise((resolve) => this.waiting.push(resolve));
+  }
+  release() {
+    const next = this.waiting.shift();
+    if (next) next(); else this.free++;
+  }
+}
+
 function sendJson(res, status, obj) {
   const body = Buffer.from(JSON.stringify(obj));
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': body.length, 'Cache-Control': 'no-store' });
@@ -96,6 +109,7 @@ export async function startServer(config, lib) {
     return g.pre;
   }
   const jobs = new Map(); // id -> job
+  const importSlots = new Slots(config.importConcurrency || 1);
   const runtimeVersion = PKG.version + '-' + Math.floor(Date.now() / 1000).toString(36);
 
   const isAdmin = (req) => {
@@ -316,13 +330,18 @@ export async function startServer(config, lib) {
       log: [], startedAt: new Date().toISOString(), game: null, error: null,
     };
     jobs.set(job.id, job);
-    importGame(lib, tmp, {
+    // One import at a time (RPGM_IMPORT_CONCURRENCY): unpacking, ffmpeg and
+    // brotli are CPU-heavy, and players come first.
+    importSlots.acquire()
+      .then(() => importGame(lib, tmp, {
       id, title: url.searchParams.get('title') || undefined,
       transcode: url.searchParams.get('transcode') || undefined,
       precompress: config.precompress,
+      limits: config.limits,
       log: (m) => { job.log.push(m); if (job.log.length > 200) job.log.shift(); },
       onProgress: (p) => Object.assign(job, { phase: p.phase, done: p.done, total: p.total, message: p.message }),
-    }).then((meta) => { job.status = 'done'; job.game = publicMeta(meta); })
+    }).finally(() => importSlots.release()))
+      .then((meta) => { job.status = 'done'; job.game = publicMeta(meta); })
       .catch((e) => { job.status = 'error'; job.error = e.message; })
       .finally(() => { fsp.rm(tmp, { force: true }); setTimeout(() => jobs.delete(job.id), 3600e3).unref(); });
     sendJson(res, 202, { job: job.id });
