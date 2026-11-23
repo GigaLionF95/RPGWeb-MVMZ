@@ -5,6 +5,7 @@ services:
     restart: unless-stopped
     ports:
       # Change the left number to use another port: RPGM_HTTP_PORT=9000 in a .env file
+      # (RPGM_HTTP_PORT=127.0.0.1:8080 listens on this machine only, e.g. behind nginx)
       - "${RPGM_HTTP_PORT:-8080}:8080"
     volumes:
       # Game library, server config and admin token. A named volume,
@@ -19,6 +20,9 @@ services:
       RPGM_ADMIN_TOKEN: ${RPGM_ADMIN_TOKEN:-}
       # Replica of another rpgm-web server (see README "Several servers")
       RPGM_UPSTREAM: ${RPGM_UPSTREAM:-}
+      RPGM_SYNC_INTERVAL: ${RPGM_SYNC_INTERVAL:-60}
+      # Server processes: auto = one per CPU core
+      RPGM_WORKERS: ${RPGM_WORKERS:-auto}
       # Hide the game list from visitors without the token
       # RPGM_PUBLIC_LIBRARY: "0"
       RPGM_MAX_UPLOAD_GB: "8"

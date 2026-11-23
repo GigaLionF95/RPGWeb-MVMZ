@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
 
 /** Merge CLI flags, env and <data>/config.json; create an admin token on first run. */
 export function loadConfig(flags = {}) {
@@ -41,6 +42,12 @@ export function loadConfig(flags = {}) {
     // admin writes to it (same admin token on every node).
     upstream: (process.env.RPGM_UPSTREAM || saved.upstream || '').replace(/\/+$/, '') || null,
     syncIntervalMs: Math.max(5, Number(process.env.RPGM_SYNC_INTERVAL || saved.syncInterval || 60)) * 1000,
+    // Server processes: 'auto' = one per CPU core (max 8), or a number.
+    workers: (() => {
+      const v = String(process.env.RPGM_WORKERS || saved.workers || 'auto');
+      const cores = os.availableParallelism?.() || os.cpus().length;
+      return Math.max(1, Math.min(64, v === 'auto' ? Math.min(8, cores) : Number(v) || 1));
+    })(),
     // Brotli/gzip copies of text files made at import (served with zero CPU).
     precompress: bool(process.env.RPGM_PRECOMPRESS, saved.precompress ?? true),
   };

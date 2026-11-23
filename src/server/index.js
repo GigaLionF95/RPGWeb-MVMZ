@@ -93,7 +93,9 @@ function safeEqual(a, b) {
 }
 
 export async function startServer(config, lib) {
-  const cache = new Lru(256 * 1024 * 1024);
+  const workers = Math.max(1, Number(process.env.RPGM_WORKER_COUNT || 1));
+  const leader = !process.env.RPGM_WORKER_ID || process.env.RPGM_WORKER_ID === '0';
+  const cache = new Lru(Math.max(32, Math.floor(256 / workers)) * 1024 * 1024);
   const inflight = new Map(); // cache key -> Promise<Buffer>, so N requests compress once
 
   /** Cached body for `key`, built at most once at a time. */
@@ -115,12 +117,35 @@ export async function startServer(config, lib) {
       .catch(() => ({}));
     return g.pre;
   }
-  const jobs = new Map(); // id -> job
+  const jobs = new Map(); // id -> job (this worker's imports)
+  // Job state also goes to disk, so any worker can answer "how is it going".
+  const jobsDir = path.join(lib.tmpDir, 'jobs');
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const jobWrites = new Map();
+  const persistJob = (job, now = false) => {
+    const write = () => { jobWrites.delete(job.id); fsp.writeFile(path.join(jobsDir, job.id + '.json'), JSON.stringify(job)).catch(() => {}); };
+    if (now) { clearTimeout(jobWrites.get(job.id)); write(); return; }
+    if (!jobWrites.has(job.id)) jobWrites.set(job.id, setTimeout(write, 250));
+  };
+  const readJob = async (id) => {
+    if (jobs.has(id)) return jobs.get(id);
+    if (!/^[0-9a-f]{16}$/.test(id)) return null;
+    try { return JSON.parse(await fsp.readFile(path.join(jobsDir, id + '.json'), 'utf8')); } catch { return null; }
+  };
   const importSlots = new Slots(config.importConcurrency || 1);
   const syncSource = createSyncSource(lib);
-  const replica = config.upstream
+  // Replica mode: every worker forwards admin writes; only the leader worker syncs.
+  const isReplica = !!config.upstream;
+  const replica = config.upstream && leader
     ? new Replica(lib, { upstream: config.upstream, token: config.adminToken, intervalMs: config.syncIntervalMs, log: (m) => console.log(m) })
     : null;
+
+  /** Ask the syncing worker to sync soon (it may be another process). */
+  const pokeSync = () => {
+    if (replica) replica.poke();
+    else if (isReplica && process.send) process.send({ rpgm: 'sync-poke' });
+  };
+  if (replica && process.send) process.on('message', (m) => { if (m && m.rpgm === 'sync-poke') replica.poke(); });
 
   /** Replica: send an admin request on to the primary, streaming both ways. */
   function proxyToPrimary(req, res, url, { inspect } = {}) {
@@ -154,7 +179,13 @@ export async function startServer(config, lib) {
       req.pipe(up);
     });
   }
-  const runtimeVersion = PKG.version + '-' + Math.floor(Date.now() / 1000).toString(36);
+  // Same on every worker and every server, changes only with the code the
+  // browser gets, so ETags and the runtime URL stay stable behind a load balancer.
+  const runtimeVersion = PKG.version + '-' + crypto.createHash('sha1')
+    .update(fs.readFileSync(path.join(RUNTIME_DIR, 'runtime.js')))
+    .update(fs.readFileSync(path.join(ROOT, 'src/server/inject.js')))
+    .update(fs.readFileSync(path.join(WEB_DIR, 'play.html')))
+    .digest('hex').slice(0, 10);
 
   const isAdmin = (req) => {
     const h = String(req.headers.authorization || '');
@@ -164,35 +195,49 @@ export async function startServer(config, lib) {
   const requireAdmin = (req) => { if (!isAdmin(req)) throw new HttpError(401, 'admin token required'); };
 
   // ---- static file sender ---------------------------------------------------
-  async function sendFile(req, res, file, { type, cacheControl, transform, cacheKey, etagSeed = '', pre }) {
-    let st;
-    try { st = await fsp.stat(file); } catch { throw new HttpError(404, 'not found'); }
-    if (!st.isFile()) throw new HttpError(404, 'not found');
+  const CHUNK = 1024 * 1024; // read files in 1 MB blocks (default 64 KB = 16x the syscalls)
+
+  async function sendFile(req, res, file, opts) {
+    // Open once and stat the handle: one path lookup per request.
+    let fh;
+    try { fh = await fsp.open(file, 'r'); } catch { throw new HttpError(404, 'not found'); }
+    let handedOff = false;
+    try {
+      const st = await fh.stat();
+      if (!st.isFile()) throw new HttpError(404, 'not found');
+      handedOff = await sendOpened(req, res, file, fh, st, opts);
+    } finally {
+      if (!handedOff) await fh.close().catch(() => {});
+    }
+  }
+
+  /** Returns true when the handle was passed to a stream (which closes it). */
+  async function sendOpened(req, res, file, fh, st, { type, cacheControl, transform, cacheKey, etagSeed = '', pre }) {
     type ||= mimeOf(file);
     const etag = `"${etagSeed}${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}${transform ? '-p' : ''}"`;
     const headers = { 'Content-Type': type, 'Cache-Control': cacheControl + ', no-transform', ETag: etag, 'X-Content-Type-Options': 'nosniff', Vary: 'Accept-Encoding' };
-    if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); res.end(); return; }
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); res.end(); return false; }
 
     const enc = isCompressible(type) && st.size > 1024 ? pickEncoding(req) : null;
 
     // Precompressed copy made at import: stream it, no CPU spent.
     const e = enc && pre?.entry;
     if (e && e[enc] && e.size === st.size && e.mtime === Math.floor(st.mtimeMs) && (e.patch || null) === (pre.patch || null)) {
-      const fh = await fsp.open(pre.file + PRE_EXT[enc]).catch(() => null);
-      if (fh) {
+      const ph = await fsp.open(pre.file + PRE_EXT[enc]).catch(() => null);
+      if (ph) {
         headers['Content-Encoding'] = enc;
         headers['Content-Length'] = e[enc];
         res.writeHead(200, headers);
-        if (req.method === 'HEAD') { await fh.close(); res.end(); return; }
-        await pipeline(fh.createReadStream(), res).catch(() => {});
-        return;
+        if (req.method === 'HEAD') { await ph.close(); res.end(); return false; }
+        await pipeline(ph.createReadStream({ highWaterMark: CHUNK }), res).catch(() => {});
+        return false;
       }
     }
 
     if (transform || enc) {
       const key = `${cacheKey || file}|${etag}|${enc || 'id'}`;
       const body = await cachedBody(key, async () => {
-        let buf = await fsp.readFile(file);
+        let buf = await fh.readFile();
         if (transform) buf = transform(buf);
         return enc ? compressAsync(buf, enc) : buf;
       });
@@ -200,7 +245,7 @@ export async function startServer(config, lib) {
       headers['Content-Length'] = body.length;
       res.writeHead(200, headers);
       res.end(req.method === 'HEAD' ? undefined : body);
-      return;
+      return false;
     }
 
     headers['Accept-Ranges'] = 'bytes';
@@ -208,7 +253,7 @@ export async function startServer(config, lib) {
     if (range === 'invalid') {
       res.writeHead(416, { 'Content-Range': `bytes */${st.size}` });
       res.end();
-      return;
+      return false;
     }
     if (range) {
       headers['Content-Range'] = `bytes ${range.start}-${range.end}/${st.size}`;
@@ -218,8 +263,11 @@ export async function startServer(config, lib) {
       headers['Content-Length'] = st.size;
       res.writeHead(200, headers);
     }
-    if (req.method === 'HEAD') { res.end(); return; }
-    await pipeline(fs.createReadStream(file, range || {}), res).catch(() => {});
+    if (req.method === 'HEAD') { res.end(); return false; }
+    if (st.size === 0) { res.end(); return false; }
+    // The stream owns the handle from here (closes it at the end or on error).
+    await pipeline(fh.createReadStream({ ...(range || {}), highWaterMark: CHUNK }), res).catch(() => {});
+    return true;
   }
 
   // ---- games -----------------------------------------------------------------
@@ -379,6 +427,7 @@ export async function startServer(config, lib) {
       log: [], startedAt: new Date().toISOString(), game: null, error: null,
     };
     jobs.set(job.id, job);
+    persistJob(job, true);
     // One import at a time (RPGM_IMPORT_CONCURRENCY): unpacking, ffmpeg and
     // brotli are CPU-heavy, and players come first.
     importSlots.acquire()
@@ -387,12 +436,16 @@ export async function startServer(config, lib) {
       transcode: url.searchParams.get('transcode') || undefined,
       precompress: config.precompress,
       limits: config.limits,
-      log: (m) => { job.log.push(m); if (job.log.length > 200) job.log.shift(); },
-      onProgress: (p) => Object.assign(job, { phase: p.phase, done: p.done, total: p.total, message: p.message }),
+      log: (m) => { job.log.push(m); if (job.log.length > 200) job.log.shift(); persistJob(job); },
+      onProgress: (p) => { Object.assign(job, { phase: p.phase, done: p.done, total: p.total, message: p.message }); persistJob(job); },
     }).finally(() => importSlots.release()))
       .then((meta) => { job.status = 'done'; job.game = publicMeta(meta); })
       .catch((e) => { job.status = 'error'; job.error = e.message; })
-      .finally(() => { fsp.rm(tmp, { force: true }); setTimeout(() => jobs.delete(job.id), 3600e3).unref(); });
+      .finally(() => {
+        persistJob(job, true);
+        fsp.rm(tmp, { force: true });
+        setTimeout(() => { jobs.delete(job.id); fsp.rm(path.join(jobsDir, job.id + '.json'), { force: true }); }, 3600e3).unref();
+      });
     sendJson(res, 202, { job: job.id });
   }
 
@@ -423,15 +476,18 @@ export async function startServer(config, lib) {
 
     // Replica: the primary owns the library. Admin writes and import jobs go
     // there; when a job finishes, pull the result before answering.
-    if (replica && (parts[0] === 'jobs' || (parts[0] === 'games' && method !== 'GET' && method !== 'HEAD'))) {
+    if (isReplica && (parts[0] === 'jobs' || (parts[0] === 'games' && method !== 'GET' && method !== 'HEAD'))) {
       requireAdmin(req);
       if (parts[0] === 'jobs') {
         return proxyToPrimary(req, res, url, {
-          inspect: async (status, body) => { if (status === 200 && JSON.parse(body).status === 'done') await replica.syncNow(); },
+          inspect: async (status, body) => {
+            if (status !== 200 || JSON.parse(body).status !== 'done') return;
+            if (replica) await replica.syncNow(); else pokeSync();
+          },
         });
       }
       await proxyToPrimary(req, res, url);
-      replica.poke();
+      pokeSync();
       return;
     }
 
@@ -475,7 +531,7 @@ export async function startServer(config, lib) {
     }
     if (parts[0] === 'jobs' && parts[1] && method === 'GET') {
       requireAdmin(req);
-      const job = jobs.get(parts[1]);
+      const job = await readJob(parts[1]);
       if (!job) throw new HttpError(404, 'job not found');
       return sendJson(res, 200, job);
     }
@@ -553,8 +609,10 @@ export async function startServer(config, lib) {
       if (p === '/healthz') {
         return sendJson(res, 200, {
           ok: true, version: PKG.version,
-          role: replica ? 'replica' : 'primary',
-          ...(replica ? { upstream: config.upstream, sync: replica.state } : {}),
+          role: isReplica ? 'replica' : 'primary',
+          ...(isReplica ? { upstream: config.upstream } : {}),
+          ...(replica ? { sync: replica.state } : {}),
+          ...(workers > 1 ? { worker: Number(process.env.RPGM_WORKER_ID || 0), workers } : {}),
         });
       }
       const play = /^\/play\/([^/]+)(?:\/(.*))?$/s.exec(p);
@@ -599,6 +657,7 @@ export async function startServer(config, lib) {
   server.keepAliveTimeout = 30_000;
 
   await new Promise((resolve) => server.listen(config.port, config.host, resolve));
+  if (!leader) return server; // the leader prints the banner and runs the sync
   if (replica) {
     console.log(`replica of ${config.upstream}: syncing every ${Math.round(config.syncIntervalMs / 1000)} s`);
     replica.start();

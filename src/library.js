@@ -44,16 +44,21 @@ export class Library {
   /** Cached { meta, files, lower } for a game; reloads when meta.json changes. */
   async get(id) {
     if (!ID_RE.test(id)) return null;
+    // Hot path (every game file request): trust the cache for a second
+    // before checking meta.json again. Changes made by this process clear
+    // the cache at once; other processes (CLI, workers, sync) show up within 1 s.
+    const c = this._cache.get(id);
+    const now = Date.now();
+    if (c && now - c.checkedAt < 1000) return c;
     const metaFile = path.join(this.gameDir(id), 'meta.json');
     let st;
     try { st = await fsp.stat(metaFile); } catch { this._cache.delete(id); return null; }
-    const c = this._cache.get(id);
-    if (c && c.mtime === st.mtimeMs) return c;
+    if (c && c.mtime === st.mtimeMs) { c.checkedAt = now; return c; }
     const meta = JSON.parse(await fsp.readFile(metaFile, 'utf8'));
     const files = JSON.parse(await fsp.readFile(path.join(this.gameDir(id), 'files.json'), 'utf8'));
     const lower = new Map();
     for (const [p] of files) if (!lower.has(p.toLowerCase())) lower.set(p.toLowerCase(), p);
-    const entry = { meta, files, lower, mtime: st.mtimeMs, fileSet: new Set(files.map(([p]) => p)) };
+    const entry = { meta, files, lower, mtime: st.mtimeMs, checkedAt: now, fileSet: new Set(files.map(([p]) => p)) };
     this._cache.set(id, entry);
     return entry;
   }

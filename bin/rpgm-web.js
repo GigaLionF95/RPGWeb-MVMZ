@@ -26,7 +26,7 @@ Usage:
 Environment: RPGM_DATA, RPGM_PORT, RPGM_HOST, RPGM_ADMIN_TOKEN, RPGM_FFMPEG,
              RPGM_PUBLIC_LIBRARY (1/0), RPGM_MAX_UPLOAD_GB, RPGM_MODE=api,
              RPGM_FRAME_ANCESTORS, RPGM_PRECOMPRESS (1/0), RPGM_MAX_UNPACKED_GB,
-             RPGM_MAX_FILES, RPGM_IMPORT_CONCURRENCY, RPGM_UPSTREAM (replica of
+             RPGM_MAX_FILES, RPGM_IMPORT_CONCURRENCY, RPGM_WORKERS (auto|N), RPGM_UPSTREAM (replica of
              this primary), RPGM_SYNC_INTERVAL (seconds)
 `;
 
@@ -64,6 +64,33 @@ function fmtBytes(n) {
 try {
   switch (cmd) {
     case 'serve': {
+      // Node serves from one core per process: run one worker per core.
+      const cluster = await import('node:cluster');
+      const n = config.workers;
+      if (n > 1 && cluster.default.isPrimary) {
+        console.log(`starting ${n} workers (RPGM_WORKERS)`);
+        let stopping = false;
+        const fork = (i) => {
+          const w = cluster.default.fork({ RPGM_WORKER_ID: String(i), RPGM_WORKER_COUNT: String(n) });
+          w.on('message', (m) => { if (m && m.rpgm === 'sync-poke') workers[0]?.send(m); });
+          w.on('exit', (code, sig) => {
+            if (stopping) return;
+            console.error(`worker ${i} exited (${sig || code}), restarting`);
+            setTimeout(() => { workers[i] = fork(i); }, 1000);
+          });
+          return w;
+        };
+        const workers = Array.from({ length: n }, (_, i) => fork(i));
+        const stop = () => {
+          stopping = true;
+          for (const w of workers) w?.kill('SIGTERM');
+          setTimeout(() => process.exit(0), 3000).unref();
+          cluster.default.on('exit', () => { if (Object.keys(cluster.default.workers).length === 0) process.exit(0); });
+        };
+        process.on('SIGINT', stop);
+        process.on('SIGTERM', stop);
+        break;
+      }
       const { startServer } = await import('../src/server/index.js');
       await startServer(config, lib);
       break;
