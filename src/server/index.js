@@ -11,7 +11,7 @@ import { mimeOf, isCompressible } from './mime.js';
 import { hookFor, patchScript, patchIndexHtml } from './inject.js';
 import { importGame } from '../importer/index.js';
 import { ID_RE } from '../library.js';
-import { decrypt } from '../importer/rpgcrypt.js';
+import { decrypt, ENCRYPTED_EXT } from '../importer/rpgcrypt.js';
 import { compressAsync, patchId, PRE_DIR, PRE_EXT } from '../precompress.js';
 import { createSyncSource, Replica, nodeIdentity, readView } from '../sync.js';
 import { Cluster, PRIMARY } from '../cluster.js';
@@ -420,7 +420,20 @@ export async function startServer(config, lib) {
     try { rel = rel.split('/').map(decodeURIComponent).join('/'); } catch { throw new HttpError(400, 'bad path'); }
     if (rel.split('/').some((s) => s === '..' || s === '.')) throw new HttpError(400, 'bad path');
     const hit = resolveGamePath(g, rel);
-    if (!hit) throw new HttpError(404, 'not found');
+    if (!hit) {
+      // A plugin asked for an encrypted asset by its plain name (texture.png
+      // when only texture.png_ exists), e.g. as the fallback after its own
+      // download failed: send it decrypted rather than a 404 that crashes the game.
+      const ext = path.extname(rel).toLowerCase();
+      const encExt = ENCRYPTED_EXT[meta.engine]?.[ext];
+      const enc = encExt && meta.encryption?.key ? resolveGamePath(g, rel.slice(0, -ext.length) + encExt) : null;
+      if (!enc) throw new HttpError(404, 'not found');
+      if (!g.local) return forwardGame(req, res, id, new URL(req.url, 'http://x'));
+      return sendFile(req, res, path.join(lib.rootDir(id), enc), {
+        type: mimeOf(rel), cacheControl: immutable,
+        transform: (buf) => decrypt(buf, meta.encryption.key), cacheKey: `dec|${id}|${enc}`, etagSeed: `r${rev}-`,
+      });
+    }
     if (!g.local) return forwardGame(req, res, id, new URL(req.url, 'http://x'));
     const hook = hookFor(hit);
     const preFiles = await preIndex(id, g);

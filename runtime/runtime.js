@@ -48,6 +48,9 @@
     };
     corsify(window.HTMLImageElement && HTMLImageElement.prototype, 'src');
     corsify(window.HTMLMediaElement && HTMLMediaElement.prototype, 'src');
+    // - scripts too, so errors in them show their message instead of
+    //   "Script error." (plugins are added as <script src> by the engine);
+    corsify(window.HTMLScriptElement && HTMLScriptElement.prototype, 'src');
     // - a Worker script must be same-origin: start it from a blob instead
     //   (MZ decodes Ogg audio in a worker);
     var OrigWorker = window.Worker;
