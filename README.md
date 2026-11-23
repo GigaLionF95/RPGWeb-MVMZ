@@ -265,6 +265,7 @@ curl -H "Authorization: Bearer $TOKEN" --data-binary @game.zip \
 | `RPGM_MAX_FILES` | `200000` | maximum number of files in an archive |
 | `RPGM_IMPORT_CONCURRENCY` | `1` | imports running at once; the rest wait in a queue |
 | `RPGM_GAME_SANDBOX` | `1` | `0`: run games without the opaque-origin sandbox (debugging only, see Security) |
+| `RPGM_WORKERS` | `auto` | server processes: one per CPU core (max 8), or a number |
 | `RPGM_UPSTREAM` | — | makes this server a replica of that primary (see [Several servers](#several-servers)) |
 | `RPGM_SYNC_INTERVAL` | `60` | replica: seconds between checks for changes on the primary |
 | `RPGM_PRECOMPRESS` | `1` | `0`: skip making `.br`/`.gz` copies at import (compress on the fly only) |
@@ -298,25 +299,67 @@ and run `docker compose up -d`. Use the primary's direct or private address when
 **Spreading players over the servers.** Pick one:
 
 - **Cloudflare, free:** add several proxied `A` records with the same name, one per server. Cloudflare spreads visitors between them. Use Cloudflare Load Balancing (paid) if you also want health checks and automatic failover.
-- **nginx in front:**
+- **nginx in front** (this is how rpgm.gigahack.org runs: Cloudflare → nginx on one server → rpgm-web on two):
 
   ```nginx
   upstream rpgm {
-      server 10.0.0.1:8080;            # primary
-      server 10.0.0.2:8080;            # replica
-      server 10.0.0.3:8080;            # replica
+      least_conn;
+      server 10.0.0.1:8080 max_fails=3 fail_timeout=10s;   # primary
+      server 10.0.0.2:8080 max_fails=3 fail_timeout=10s;   # replica
+      keepalive 64;
   }
   server {
       server_name games.example.com;
       client_max_body_size 8g;
       location / {
           proxy_pass http://rpgm;
+          proxy_http_version 1.1;
+          proxy_set_header Connection "";
+          proxy_set_header Host $host;
           proxy_request_buffering off;
           proxy_read_timeout 1h;
-          proxy_set_header Host $host;
+          # A node that is down, or a replica that has not pulled a new game
+          # yet: nginx retries the request on another node.
+          proxy_next_upstream error timeout http_502 http_503 http_504 http_404;
+          proxy_next_upstream_tries 2;
       }
   }
   ```
+
+  Keep the nodes' port closed to everyone but the balancer (firewall). With Docker on the balancer machine, `RPGM_HTTP_PORT=127.0.0.1:8080` publishes the port on localhost only.
+
+## Performance
+
+Measured on the public demo: 2 × 2-vCPU VPS (AMD Ryzen 9 9950X, 8 GB RAM), Node.js 22.
+
+**Importing** (Docker, on one of those servers; includes unpacking, Brotli precompression and, for MV, converting audio for iPhone):
+
+| Game | Archive | Files | Time | Peak RAM |
+|---|---|---|---|---|
+| Star Knightess Aura (MZ) | 761 MB | 8,408 | 57 s | 156 MB |
+| Hypnosis Knight-Princess (MZ) | 1.28 GB | 6,449 | 54 s | 152 MB |
+| Claire's Quest (MV, 41 media files converted) | 2.45 GB | 4,262 | 78 s | 147 MB |
+
+Memory stays flat whatever the archive size: everything is streamed.
+
+**Serving** one 2-vCPU node, load generated from the other server over the network: random files from the three games, browser-like (`Accept-Encoding: br`), 128 connections:
+
+| Processes (`RPGM_WORKERS`) | Requests/s | Throughput | p99 latency | CPU |
+|---|---|---|---|---|
+| 1 | 1,750 | 365 MB/s | 131 ms | 1.5 cores |
+| 2 (auto) | 2,060 | 442 MB/s (≈ 3.5 Gbit/s) | 112 ms | 2 cores (all) |
+
+No errors. Idle memory ~70 MB per process. Game files are big (≈ 210 KB per request on average), so the limit is copying bytes, not handling requests. Add cores, or nodes (see [Several servers](#several-servers)). With Cloudflare in front, most requests never reach the server at all.
+
+**What a player downloads** to reach the first screen (fresh browser, through Cloudflare):
+
+| Game | Size on server | Downloaded | Requests |
+|---|---|---|---|
+| Star Knightess Aura | 771 MB | 3.6 MB | 267 |
+| Claire's Quest | 2.3 GB | 4.5 MB | 114 |
+| Hypnosis Knight-Princess | 1.3 GB | 410 MB | 1,196 |
+
+The engine loads assets as they are needed. Hypnosis Knight-Princess loads its Live2D models up front, by design, exactly as the desktop build does.
 
 ## systemd
 

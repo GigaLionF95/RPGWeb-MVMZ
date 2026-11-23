@@ -68,6 +68,10 @@ try {
       const cluster = await import('node:cluster');
       const n = config.workers;
       if (n > 1 && cluster.default.isPrimary) {
+        // Workers accept connections themselves. The default on Linux (the
+        // primary accepts and hands each socket over IPC) turns the primary
+        // into the bottleneck when connections are short-lived.
+        cluster.default.schedulingPolicy = cluster.default.SCHED_NONE;
         console.log(`starting ${n} workers (RPGM_WORKERS)`);
         let stopping = false;
         const fork = (i) => {
