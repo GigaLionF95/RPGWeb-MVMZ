@@ -16,7 +16,7 @@
 <!-- "*": the sandboxed game has an opaque origin, which never matches the
      default allowlist (the frame's URL), so features must be granted to any. -->
 <iframe id="game" title="Game" allow="fullscreen *; autoplay *; gamepad *; clipboard-write *; screen-wake-lock *"></iframe>
-<script>
+<script data-cfasync="false">
 /*
  * Host page for one game. The game itself runs in the frame below with an
  * opaque origin (CSP sandbox from the server + the sandbox attribute), so its
