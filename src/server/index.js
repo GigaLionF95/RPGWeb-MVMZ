@@ -524,6 +524,12 @@ export async function startServer(config, lib) {
       await fsp.rm(tmp, { force: true });
       throw e instanceof HttpError ? e : new HttpError(400, 'upload failed: ' + e.message);
     }
+    return sendJson(res, 202, { job: startImport(tmp, url.searchParams) });
+  }
+
+  /** Queue the import of an uploaded archive; returns the job id. */
+  function startImport(tmp, params) {
+    const id = params.get('id') || undefined;
     const job = {
       id: crypto.randomBytes(8).toString('hex'), status: 'running', phase: 'queued', done: 0, total: 0,
       log: [], startedAt: new Date().toISOString(), game: null, error: null,
@@ -534,8 +540,8 @@ export async function startServer(config, lib) {
     // brotli are CPU-heavy, and players come first.
     importSlots.acquire()
       .then(() => importGame(lib, tmp, {
-      id, title: url.searchParams.get('title') || undefined,
-      transcode: url.searchParams.get('transcode') || undefined,
+      id, title: params.get('title') || undefined,
+      transcode: params.get('transcode') || undefined,
       precompress: config.precompress,
       webp: config.webp,
       limits: config.limits,
@@ -549,7 +555,96 @@ export async function startServer(config, lib) {
         fsp.rm(tmp, { force: true });
         setTimeout(() => { jobs.delete(job.id); fsp.rm(path.join(jobsDir, job.id + '.json'), { force: true }); }, 3600e3).unref();
       });
-    sendJson(res, 202, { job: job.id });
+    return job.id;
+  }
+
+  // ---- chunked uploads --------------------------------------------------------
+  // Proxies and CDNs cap request bodies (Cloudflare: 100 MB), so the library
+  // page sends archives in pieces. The file on disk is the state: any worker
+  // can take the next piece, and a piece that failed is simply sent again.
+  //   POST   /api/uploads?filename=&size=        → { upload, chunkSize }
+  //   PUT    /api/uploads/<id>?offset=<bytes>    one piece → { received }
+  //   GET    /api/uploads/<id>                   → { received, size } (resume)
+  //   POST   /api/uploads/<id>/finish?id=&title=&transcode=  → { job }
+  //   DELETE /api/uploads/<id>
+  const CHUNK_MAX = 96 * 1024 * 1024;
+  const uploadsDir = path.join(lib.tmpDir, 'uploads');
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  const upPath = (uid) => {
+    if (!/^[0-9a-f]{24}$/.test(uid)) throw new HttpError(404, 'upload not found');
+    return { data: path.join(uploadsDir, uid + '.part'), metaFile: path.join(uploadsDir, uid + '.json') };
+  };
+  async function upState(uid) {
+    const p = upPath(uid);
+    let meta;
+    try { meta = JSON.parse(await fsp.readFile(p.metaFile, 'utf8')); } catch { throw new HttpError(404, 'upload not found (it expires after a day)'); }
+    const received = (await fsp.stat(p.data).catch(() => ({ size: 0 }))).size;
+    return { ...p, meta, received };
+  }
+  async function handleChunked(req, res, url, parts) {
+    requireAdmin(req);
+    const method = req.method;
+    if (parts.length === 1 && method === 'POST') {
+      const size = Number(url.searchParams.get('size'));
+      if (!Number.isSafeInteger(size) || size <= 0) throw new HttpError(400, 'size is required');
+      if (size > config.maxUploadBytes) throw new HttpError(413, 'archive too large');
+      const name = path.basename(url.searchParams.get('filename') || 'upload.zip').replace(/[^\w.\- ]+/g, '_');
+      const uid = crypto.randomBytes(12).toString('hex');
+      const p = upPath(uid);
+      await fsp.writeFile(p.data, '');
+      await fsp.writeFile(p.metaFile, JSON.stringify({ name, size, createdAt: Date.now() }));
+      return sendJson(res, 201, { upload: uid, chunkSize: 64 * 1024 * 1024, maxChunk: CHUNK_MAX });
+    }
+    const st = await upState(parts[1]);
+    if (parts.length === 2 && method === 'GET') return sendJson(res, 200, { received: st.received, size: st.meta.size });
+    if (parts.length === 2 && method === 'DELETE') {
+      await fsp.rm(st.data, { force: true }); await fsp.rm(st.metaFile, { force: true });
+      return sendJson(res, 200, { removed: parts[1] });
+    }
+    if (parts.length === 2 && method === 'PUT') {
+      const offset = Number(url.searchParams.get('offset'));
+      // The client and the file disagree (a lost reply, a retry): tell it where we are.
+      if (offset !== st.received) return sendJson(res, 409, { error: 'offset mismatch', received: st.received });
+      const len = Number(req.headers['content-length'] || 0);
+      if (len > CHUNK_MAX || st.received + len > st.meta.size) throw new HttpError(413, 'piece too large');
+      let n = 0;
+      const limiter = async function* (src) {
+        for await (const c of src) {
+          n += c.length;
+          if (n > CHUNK_MAX || st.received + n > st.meta.size) throw new HttpError(413, 'piece too large');
+          yield c;
+        }
+      };
+      try {
+        await pipeline(req, limiter, fs.createWriteStream(st.data, { flags: 'r+', start: offset }));
+      } catch (e) {
+        await fsp.truncate(st.data, offset).catch(() => {}); // a broken piece leaves nothing behind
+        throw e instanceof HttpError ? e : new HttpError(400, 'upload failed: ' + e.message);
+      }
+      return sendJson(res, 200, { received: offset + n });
+    }
+    if (parts.length === 3 && parts[2] === 'finish' && method === 'POST') {
+      if (st.received !== st.meta.size) return sendJson(res, 409, { error: `incomplete: ${st.received} of ${st.meta.size} bytes`, received: st.received });
+      const id = url.searchParams.get('id');
+      if (id && !ID_RE.test(id)) throw new HttpError(400, 'invalid id');
+      const tmp = path.join(lib.tmpDir, `upload-${parts[1]}-${st.meta.name}`);
+      await fsp.rename(st.data, tmp);
+      await fsp.rm(st.metaFile, { force: true });
+      return sendJson(res, 202, { job: startImport(tmp, url.searchParams) });
+    }
+    throw new HttpError(404, 'unknown endpoint');
+  }
+  /** Drop uploads nobody finished within a day. */
+  async function sweepUploads() {
+    for (const f of await fsp.readdir(uploadsDir).catch(() => [])) {
+      if (!f.endsWith('.json')) continue;
+      const p = path.join(uploadsDir, f);
+      try {
+        if (Date.now() - JSON.parse(await fsp.readFile(p, 'utf8')).createdAt < 86400e3) continue;
+      } catch { /* unreadable: drop */ }
+      await fsp.rm(p, { force: true });
+      await fsp.rm(p.replace(/\.json$/, '.part'), { force: true });
+    }
   }
 
   async function handleApi(req, res, url) {
@@ -598,7 +693,7 @@ export async function startServer(config, lib) {
 
     // Replica: the primary owns the library. Admin writes and import jobs go
     // there; when a job finishes, pull the result before answering.
-    if (isReplica && (parts[0] === 'jobs' || (parts[0] === 'games' && method !== 'GET' && method !== 'HEAD'))) {
+    if (isReplica && (parts[0] === 'jobs' || parts[0] === 'uploads' || (parts[0] === 'games' && method !== 'GET' && method !== 'HEAD'))) {
       requireAdmin(req);
       if (parts[0] === 'jobs') {
         return proxyToPrimary(req, res, url, {
@@ -613,6 +708,7 @@ export async function startServer(config, lib) {
       return;
     }
 
+    if (parts[0] === 'uploads') return handleChunked(req, res, url, parts);
     if (parts[0] === 'auth' && method === 'GET') return sendJson(res, isAdmin(req) ? 200 : 401, { admin: isAdmin(req) });
     if (parts[0] === 'games' && parts.length === 1) {
       if (method === 'GET') {
@@ -787,6 +883,10 @@ export async function startServer(config, lib) {
 
   await new Promise((resolve) => server.listen(config.port, config.host, resolve));
   if (!leader) return server; // the leader prints the banner and runs the sync
+  if (!isReplica) {
+    sweepUploads();
+    setInterval(sweepUploads, 3600e3).unref();
+  }
   if (cluster) {
     const t = setInterval(() => cluster.tick(), 5000);
     t.unref();

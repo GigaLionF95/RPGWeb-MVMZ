@@ -72,7 +72,7 @@ docker compose exec rpgm-web node /app/bin/rpgm-web.js token
 
 **6. Add a game.** On the library page, click **Admin**, paste the token, then **Add game** and drop the game's archive (the `.zip` you downloaded from itch.io or similar). That's it: click the game to play.
 
-For big archives (over 100 MB behind Cloudflare), copy them into the `imports` folder and import from the terminal:
+The page uploads archives in 64 MB pieces, so any size goes through Cloudflare and other proxies that cap request bodies. A piece that fails is sent again, so a shaky connection does not restart the whole upload. You can also copy an archive into the `imports` folder and import it from the terminal:
 
 ```bash
 docker compose exec rpgm-web node /app/bin/rpgm-web.js import "/imports/My Game.zip"
@@ -236,7 +236,11 @@ Write requests need `Authorization: Bearer <token>`.
 | Method | Path | |
 |---|---|---|
 | `GET` | `/api/games` | list games (hidden ones only for the admin; admin-only in API mode) |
-| `POST` | `/api/games?filename=game.zip[&id=…][&title=…]` | body is the archive; replies `202 {job}` |
+| `POST` | `/api/games?filename=game.zip[&id=…][&title=…]` | body is the archive; replies `202 {job}`. One request: behind Cloudflare, 100 MB at most. Use the upload below for anything bigger |
+| `POST` | `/api/uploads?filename=game.zip&size=<bytes>` | start an upload in pieces: `201 {upload, chunkSize}` |
+| `PUT` | `/api/uploads/<upload>?offset=<bytes>` | body is the next piece (up to 96 MB): `200 {received}`. A wrong offset gets `409 {received}`: continue from there |
+| `GET` | `/api/uploads/<upload>` | `{received, size}`, to resume after a break |
+| `POST` | `/api/uploads/<upload>/finish[?id=…][&title=…]` | all bytes are in: starts the import, `202 {job}`. Unfinished uploads are deleted after a day |
 | `GET` | `/api/jobs/<job>` | import status: phase, progress, log |
 | `GET` | `/api/games/<id>` | game info, including `url`, `embedUrl`, `coverUrl`, `screen` |
 | `PATCH` | `/api/games/<id>` | `{"title": "…", "hidden": true, "preload": false}`. `preload`: Live2D preload for this game, `true`/`false`, or `null` for the server default (`RPGM_PRELOAD`). `hidden` means *unlisted*: the game leaves the public list, but `/play/<id>/`, `/embed/<id>/` and `GET /api/games/<id>` keep working for anyone with the link |
@@ -319,7 +323,7 @@ RPGM_UPSTREAM=http://10.0.0.1:8080
 RPGM_ADVERTISE_URL=http://10.0.0.2:8080
 ```
 
-and run `docker compose up -d`. Use the primary's direct or private address when you can, not a Cloudflare-proxied hostname. Cloudflare limits request bodies to 100 MB, and uploads forwarded by a replica would hit that limit. Import from the command line on the primary only: a replica refuses CLI imports, because the next sync would remove them.
+and run `docker compose up -d`. Use the primary's direct or private address when you can, not a Cloudflare-proxied hostname. Uploads made through a replica are forwarded to it piece by piece. Import from the command line on the primary only: a replica refuses CLI imports, because the next sync would remove them.
 
 **Spreading players over the servers.** Pick one:
 
@@ -549,7 +553,7 @@ Check it: request a JSON file twice and look for `cf-cache-status: HIT`:
 curl -sI https://games.example.com/play/<id>/r1/data/System.json | grep -i cf-cache-status
 ```
 
-Limits: the free plan caches files up to 512 MB and accepts uploads up to 100 MB. Import larger archives with the CLI on the server.
+Limits: the free plan caches files up to 512 MB and accepts request bodies up to 100 MB. The library page uploads in 64 MB pieces, so archive size does not matter.
 
 ### What players download
 

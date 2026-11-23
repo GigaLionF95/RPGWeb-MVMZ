@@ -210,29 +210,56 @@ const job = {
   },
 };
 
-function upload(file) {
-  const qs = new URLSearchParams({ filename: file.name });
+// Archives go up in pieces: proxies and CDNs cap request bodies (Cloudflare:
+// 100 MB), and a piece that fails is sent again instead of the whole file.
+function sendPiece(url, blob, onProgress) {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    xhr.upload.onprogress = (e) => onProgress(e.loaded);
+    xhr.onerror = () => resolve({ status: 0, body: {} });
+    xhr.onload = () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch { /* not json */ }
+      resolve({ status: xhr.status, body });
+    };
+    xhr.send(blob);
+  });
+}
+
+async function upload(file) {
+  const qs = new URLSearchParams();
   const title = $('#up-title').value.trim();
   const id = $('#up-id').value.trim();
   if (title) qs.set('title', title);
   if (id) qs.set('id', id);
-  job.show(`Uploading ${file.name}`);
+  const label = `Uploading ${file.name}`;
+  job.show(label);
   drop.setAttribute('aria-disabled', 'true');
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', `api/games?${qs}`);
-  xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-  xhr.upload.onprogress = (e) => {
-    if (e.lengthComputable) job.set(`Uploading ${file.name}`, e.loaded / e.total, `${fmtBytes(e.loaded)} / ${fmtBytes(e.total)}`);
-  };
-  xhr.onerror = () => fail('The upload was interrupted. Check the connection and try again.');
-  xhr.onload = () => {
-    let body = {};
-    try { body = JSON.parse(xhr.responseText); } catch { /* not json */ }
-    if (xhr.status !== 202) return fail(body.error || `Upload failed (${xhr.status})`);
+  try {
+    const start = await api(`uploads?${new URLSearchParams({ filename: file.name, size: String(file.size) })}`, { method: 'POST' });
+    const up = start.upload;
+    const chunk = start.chunkSize || 64 * 1024 * 1024;
+    let offset = 0, tries = 0;
+    while (offset < file.size) {
+      const end = Math.min(file.size, offset + chunk);
+      const show = (n) => job.set(label, (offset + n) / file.size, `${fmtBytes(offset + n)} / ${fmtBytes(file.size)}`);
+      const r = await sendPiece(`api/uploads/${up}?offset=${offset}`, file.slice(offset, end), show);
+      if (r.status === 200) { offset = r.body.received; tries = 0; continue; }
+      if (r.status === 409 && typeof r.body.received === 'number') { offset = r.body.received; continue; } // resync
+      if (r.status === 401) throw new Error('Signed out: sign in again and retry.');
+      if (r.status === 413 || r.status === 404) throw new Error(r.body.error || `Upload failed (${r.status})`);
+      if (++tries > 6) throw new Error(r.status ? `Upload failed (${r.status})` : 'The upload keeps failing. Check the connection and try again.');
+      job.set(`${label} (retrying, ${tries}/6)`, offset / file.size, `${fmtBytes(offset)} / ${fmtBytes(file.size)}`);
+      await new Promise((res) => setTimeout(res, Math.min(30000, 1000 * 2 ** tries)));
+    }
+    const done = await api(`uploads/${up}/finish?${qs}`, { method: 'POST' });
     job.set('Importing', 0);
-    poll(body.job);
-  };
-  xhr.send(file);
+    poll(done.job);
+  } catch (e) {
+    fail(e.message);
+  }
 }
 
 const PHASES = { queued: 'Waiting', extract: 'Extracting', locate: 'Finding the game', transcode: 'Converting media for phones', precompress: 'Compressing text files', images: 'Optimizing images', install: 'Installing', done: 'Done' };
