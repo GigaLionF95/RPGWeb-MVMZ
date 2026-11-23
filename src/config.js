@@ -27,5 +27,7 @@ export function loadConfig(flags = {}) {
     // CSP frame-ancestors for embeds: '*' (anyone) or a space-separated list of origins
     frameAncestors: process.env.RPGM_FRAME_ANCESTORS || saved.frameAncestors || '*',
     trustProxy: bool(process.env.RPGM_TRUST_PROXY, saved.trustProxy ?? false),
+    // Brotli/gzip copies of text files made at import (served with zero CPU).
+    precompress: bool(process.env.RPGM_PRECOMPRESS, saved.precompress ?? true),
   };
 }

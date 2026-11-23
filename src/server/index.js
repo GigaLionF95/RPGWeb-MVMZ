@@ -3,7 +3,6 @@ import http from 'node:http';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
@@ -12,6 +11,7 @@ import { hookFor, patchScript, patchIndexHtml } from './inject.js';
 import { importGame } from '../importer/index.js';
 import { ID_RE } from '../library.js';
 import { decrypt } from '../importer/rpgcrypt.js';
+import { compressAsync, patchId, PRE_DIR, PRE_EXT } from '../precompress.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const WEB_DIR = path.join(ROOT, 'web');
@@ -56,11 +56,6 @@ function pickEncoding(req) {
   return null;
 }
 
-function compress(buf, enc) {
-  if (enc === 'br') return zlib.brotliCompressSync(buf, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: buf.length } });
-  return zlib.gzipSync(buf, { level: 6 });
-}
-
 function parseRange(header, size) {
   const m = /^bytes=(\d*)-(\d*)$/.exec(String(header || '').trim());
   if (!m) return null;
@@ -79,6 +74,27 @@ function safeEqual(a, b) {
 
 export async function startServer(config, lib) {
   const cache = new Lru(256 * 1024 * 1024);
+  const inflight = new Map(); // cache key -> Promise<Buffer>, so N requests compress once
+
+  /** Cached body for `key`, built at most once at a time. */
+  function cachedBody(key, make) {
+    const hit = cache.get(key);
+    if (hit) return hit;
+    let p = inflight.get(key);
+    if (!p) {
+      p = make().then((body) => { cache.set(key, body); return body; }).finally(() => inflight.delete(key));
+      inflight.set(key, p);
+    }
+    return p;
+  }
+
+  /** Precompressed index of a game, read once per meta version. */
+  function preIndex(id, g) {
+    g.pre ??= fsp.readFile(path.join(lib.gameDir(id), PRE_DIR, 'index.json'), 'utf8')
+      .then((t) => JSON.parse(t).files || {})
+      .catch(() => ({}));
+    return g.pre;
+  }
   const jobs = new Map(); // id -> job
   const runtimeVersion = PKG.version + '-' + Math.floor(Date.now() / 1000).toString(36);
 
@@ -90,7 +106,7 @@ export async function startServer(config, lib) {
   const requireAdmin = (req) => { if (!isAdmin(req)) throw new HttpError(401, 'admin token required'); };
 
   // ---- static file sender ---------------------------------------------------
-  async function sendFile(req, res, file, { type, cacheControl, transform, cacheKey, etagSeed = '' }) {
+  async function sendFile(req, res, file, { type, cacheControl, transform, cacheKey, etagSeed = '', pre }) {
     let st;
     try { st = await fsp.stat(file); } catch { throw new HttpError(404, 'not found'); }
     if (!st.isFile()) throw new HttpError(404, 'not found');
@@ -100,15 +116,28 @@ export async function startServer(config, lib) {
     if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); res.end(); return; }
 
     const enc = isCompressible(type) && st.size > 1024 ? pickEncoding(req) : null;
+
+    // Precompressed copy made at import: stream it, no CPU spent.
+    const e = enc && pre?.entry;
+    if (e && e[enc] && e.size === st.size && e.mtime === Math.floor(st.mtimeMs) && (e.patch || null) === (pre.patch || null)) {
+      const fh = await fsp.open(pre.file + PRE_EXT[enc]).catch(() => null);
+      if (fh) {
+        headers['Content-Encoding'] = enc;
+        headers['Content-Length'] = e[enc];
+        res.writeHead(200, headers);
+        if (req.method === 'HEAD') { await fh.close(); res.end(); return; }
+        await pipeline(fh.createReadStream(), res).catch(() => {});
+        return;
+      }
+    }
+
     if (transform || enc) {
       const key = `${cacheKey || file}|${etag}|${enc || 'id'}`;
-      let body = cache.get(key);
-      if (!body) {
+      const body = await cachedBody(key, async () => {
         let buf = await fsp.readFile(file);
         if (transform) buf = transform(buf);
-        body = enc ? compress(buf, enc) : buf;
-        cache.set(key, body);
-      }
+        return enc ? compressAsync(buf, enc) : buf;
+      });
       if (enc) headers['Content-Encoding'] = enc;
       headers['Content-Length'] = body.length;
       res.writeHead(200, headers);
@@ -176,9 +205,11 @@ export async function startServer(config, lib) {
     if (rel.startsWith('__rpgm/')) {
       const name = rel.slice(7);
       if (name === 'files.json') {
-        const body = Buffer.from(JSON.stringify(g.files.map(([p, s]) => [p, s])));
         const enc = pickEncoding(req);
-        const out = enc ? compress(body, enc) : body;
+        const out = await cachedBody(`files|${id}|${g.mtime}|${enc || 'id'}`, async () => {
+          const body = Buffer.from(JSON.stringify(g.files.map(([p, s]) => [p, s])));
+          return enc ? compressAsync(body, enc) : body;
+        });
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': immutable + ', no-transform', ...(enc ? { 'Content-Encoding': enc } : {}), 'Content-Length': out.length, Vary: 'Accept-Encoding' });
         return res.end(out);
       }
@@ -200,7 +231,9 @@ export async function startServer(config, lib) {
     const hit = resolveGamePath(g, rel);
     if (!hit) throw new HttpError(404, 'not found');
     const hook = hookFor(hit);
+    const preFiles = await preIndex(id, g);
     return sendFile(req, res, path.join(lib.rootDir(id), hit), {
+      pre: preFiles[hit] ? { entry: preFiles[hit], file: path.join(lib.gameDir(id), PRE_DIR, hit), patch: patchId(hook) } : null,
       cacheControl: hook ? 'no-cache' : immutable,
       transform: hook ? (buf) => patchScript(buf, hook) : null,
       cacheKey: hook ? `hook|${id}|${hit}|${runtimeVersion}` : null,
@@ -286,6 +319,7 @@ export async function startServer(config, lib) {
     importGame(lib, tmp, {
       id, title: url.searchParams.get('title') || undefined,
       transcode: url.searchParams.get('transcode') || undefined,
+      precompress: config.precompress,
       log: (m) => { job.log.push(m); if (job.log.length > 200) job.log.shift(); },
       onProgress: (p) => Object.assign(job, { phase: p.phase, done: p.done, total: p.total, message: p.message }),
     }).then((meta) => { job.status = 'done'; job.game = publicMeta(meta); })

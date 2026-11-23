@@ -12,16 +12,18 @@ const HELP = `rpgm-web — run RPG Maker MV/MZ games in the browser
 Usage:
   rpgm-web serve  [--port 8080] [--host 0.0.0.0] [--data ./data] [--api-only]
   rpgm-web import <archive-or-folder> [--id my-game] [--title "Title"] [--transcode auto|off|audio|video]
+                  [--no-precompress]
   rpgm-web list
   rpgm-web info   <id>
   rpgm-web remove <id>
-  rpgm-web refresh <id>|--all       re-detect resolution, cover art, media
+  rpgm-web refresh <id>|--all       re-detect resolution, cover art, media; rebuild
+                                    precompressed .br/.gz copies (--no-precompress to skip)
   rpgm-web cover  <id> <image.png|jpg|webp> | --remove
   rpgm-web token          print the admin API token
 
 Environment: RPGM_DATA, RPGM_PORT, RPGM_HOST, RPGM_ADMIN_TOKEN, RPGM_FFMPEG,
              RPGM_PUBLIC_LIBRARY (1/0), RPGM_MAX_UPLOAD_GB, RPGM_MODE=api,
-             RPGM_FRAME_ANCESTORS
+             RPGM_FRAME_ANCESTORS, RPGM_PRECOMPRESS (1/0)
 `;
 
 const { values: opt, positionals } = parseArgs({
@@ -37,6 +39,7 @@ const { values: opt, positionals } = parseArgs({
     all: { type: 'boolean' },
     'api-only': { type: 'boolean' },
     remove: { type: 'boolean' },
+    'no-precompress': { type: 'boolean' },
   },
 });
 
@@ -66,6 +69,7 @@ try {
       let lastLine = '';
       const meta = await importGame(lib, path.resolve(args[0]), {
         id: opt.id, title: opt.title, transcode: opt.transcode,
+        precompress: !opt['no-precompress'] && config.precompress,
         log: (m) => { if (lastLine) process.stderr.write('\n'); lastLine = ''; console.log('•', m); },
         onProgress: ({ phase, done, total, message }) => {
           if (!process.stderr.isTTY || !total || total <= 1) return;
@@ -99,7 +103,10 @@ try {
       const ids = opt.all ? (await lib.list()).map((g) => g.id) : [args[0]];
       if (!ids[0]) throw new Error('refresh: give an <id> or --all');
       for (const id of ids) {
-        const m = await refreshGame(lib, id);
+        const m = await refreshGame(lib, id, {
+          precompress: !opt['no-precompress'] && config.precompress,
+          log: (msg) => console.log('  •', msg),
+        });
         console.log(`refreshed ${id}: ${m.engine.toUpperCase()} ${m.screen.width}x${m.screen.height}${m.titleArt ? ', title art ' + m.titleArt : ''}`);
       }
       break;

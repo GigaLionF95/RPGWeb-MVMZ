@@ -227,7 +227,7 @@ function upload(file) {
   xhr.send(file);
 }
 
-const PHASES = { queued: 'Waiting', extract: 'Extracting', locate: 'Finding the game', transcode: 'Converting media for phones', install: 'Installing', done: 'Done' };
+const PHASES = { queued: 'Waiting', extract: 'Extracting', locate: 'Finding the game', transcode: 'Converting media for phones', precompress: 'Compressing text files', install: 'Installing', done: 'Done' };
 
 async function poll(id) {
   let seen = 0;

@@ -11,6 +11,7 @@ import { locateGame } from './locate.js';
 import { analyzeGame, listFiles } from './analyze.js';
 import { findFfmpeg, planTranscodes, runTranscodes } from './transcode.js';
 import { ID_RE } from '../library.js';
+import { precompressTree, precompressGame } from '../precompress.js';
 
 const JUNK = new Set(['desktop.ini', 'thumbs.db', '.ds_store']);
 
@@ -73,7 +74,7 @@ async function removeJunk(root) {
 }
 
 /** Re-run detection on an installed game (after upgrades of the analyzer). */
-export async function refreshGame(lib, id) {
+export async function refreshGame(lib, id, opts = {}) {
   const g = await lib.get(id);
   if (!g) throw new Error(`no game "${id}"`);
   const files = await listFiles(lib.rootDir(id));
@@ -83,6 +84,7 @@ export async function refreshGame(lib, id) {
   for (const k of keep) if (g.meta[k] !== undefined) meta[k] = g.meta[k];
   await fsp.writeFile(path.join(lib.gameDir(id), 'files.json'), JSON.stringify(files));
   await lib.writeMeta(id, meta);
+  if (opts.precompress !== false) await precompressGame(lib, id, { log: opts.log });
   return meta;
 }
 
@@ -90,7 +92,8 @@ export async function refreshGame(lib, id) {
  * @param {import('../library.js').Library} lib
  * @param {string} source  path to an archive or folder
  * @param {{id?:string,title?:string,transcode?:'auto'|'off'|'audio'|'video'|'all',
- *          onProgress?:Function, log?:Function, keepSource?:boolean}} opts
+ *          onProgress?:Function, log?:Function, keepSource?:boolean,
+ *          precompress?:boolean}} opts
  */
 export async function importGame(lib, source, opts = {}) {
   const log = opts.log || (() => {});
@@ -163,8 +166,16 @@ export async function importGame(lib, source, opts = {}) {
       transcode,
       hidden: prev?.meta?.hidden || false,
     };
+    // Text assets compressed once now, so serving them costs no CPU.
+    let preDir = null;
+    if (opts.precompress !== false) {
+      preDir = path.join(work, 'pre');
+      await precompressTree(staged, files, preDir, {
+        log, onProgress: (d, t) => progress('precompress', d, t, 'Compressing text files'),
+      });
+    }
     progress('install', 0, 1, 'Installing');
-    await lib.install(id, staged, files, meta);
+    await lib.install(id, staged, files, meta, { preDir });
     log(`installed as "${id}" (rev ${meta.rev})`);
     progress('done', 1, 1, 'Done');
     return meta;

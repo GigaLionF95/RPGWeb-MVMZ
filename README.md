@@ -62,10 +62,11 @@ node bin/rpgm-web.js serve --port 8080
 ```
 rpgm-web serve   [--port 8080] [--host 0.0.0.0] [--data ./data] [--api-only]
 rpgm-web import  <archive-or-folder> [--id my-game] [--title "Title"] [--transcode auto|off|audio|video]
+                 [--no-precompress]
 rpgm-web list
 rpgm-web info    <id>
 rpgm-web remove  <id>
-rpgm-web refresh <id> | --all                 re-detect resolution, cover art, media
+rpgm-web refresh <id> | --all                 re-detect resolution, cover art, media; rebuild precompressed files
 rpgm-web cover   <id> <image.png|jpg|webp> | --remove
 rpgm-web token
 ```
@@ -194,6 +195,7 @@ curl -H "Authorization: Bearer $TOKEN" --data-binary @game.zip \
 | `RPGM_FRAME_ANCESTORS` | `*` | sites allowed to embed games, space-separated |
 | `RPGM_MAX_UPLOAD_GB` | `8` | maximum archive upload size |
 | `RPGM_FFMPEG` | `ffmpeg` | path to ffmpeg |
+| `RPGM_PRECOMPRESS` | `1` | `0`: skip making `.br`/`.gz` copies at import (compress on the fly only) |
 
 ## systemd
 
@@ -224,10 +226,114 @@ server {
 }
 ```
 
-**Cloudflare.** The server sends `Cache-Control: no-transform` and marks every game script `data-cfasync="false"`, so Rocket Loader and other HTML "optimizations" leave them alone. Without this, games hang on a black screen. The free plan only proxies request bodies up to 100 MB, so import large archives with the CLI on the server.
-
 All links are relative, so the server can also live in a sub-path (`location /games/ { proxy_pass http://127.0.0.1:8080/; }`).
-Game assets are served with `Cache-Control: immutable`; JS and JSON are compressed with Brotli or gzip.
+
+Optional: let nginx keep its own copy of game files, so Node only serves each file once. Worth it without a CDN in front, or when the data disk is slow.
+
+```nginx
+# in http { }
+proxy_cache_path /var/cache/nginx/rpgm levels=1:2 keys_zone=rpgm:50m
+                 max_size=20g inactive=30d use_temp_path=off;
+
+# in server { }, next to location /
+location /play/ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_cache rpgm;                  # follows the server's Cache-Control:
+    proxy_cache_lock on;               # immutable assets are kept, no-cache pages are not
+    proxy_cache_use_stale error timeout updating;
+    add_header X-Cache $upstream_cache_status;
+}
+```
+
+## Caching and compression
+
+What the server sends:
+
+| URL | `Cache-Control` | Why |
+|---|---|---|
+| `/play/<id>/` | `no-store` | redirects to the current revision, `/play/<id>/r<rev>/` |
+| `/play/<id>/r<rev>/` (index.html), engine scripts `rpg_*.js` / `rmmz_*.js` / `plugins.js` | `no-cache` + `ETag` | patched at serve time with the runtime; revalidated, usually a `304` |
+| every other file under `/play/<id>/r<rev>/` | `public, max-age=31536000, immutable` | the revision is in the URL: re-importing a game bumps it, so a cached file is never stale |
+| `/api/…` | `no-store` | |
+
+Text files (JS, JSON, CSS, SVG…) go out with Brotli or gzip. Compression never blocks the server:
+
+- **At import**, rpgm-web writes max-quality Brotli and gzip copies of every text file to `data/games/<id>/precompressed/`. Requests stream them straight from disk with no CPU work. They are usually ~10× smaller than the originals and add about 1% to the game's size on disk (Haven: 47 MB of JSON/JS → 2.8 MB). Run `rpgm-web refresh --all` once to add them to games imported by older versions.
+- **Anything else** (a game without copies, files changed by hand) is compressed on the fly in the thread pool. The result is kept in a 256 MB in-memory cache. Parallel requests for the same file share one compression.
+
+Images, audio and video are already compressed and go out as-is, with byte-range support.
+
+### Cloudflare
+
+By default Cloudflare caches files by extension only. It skips game data (`.json`) and encrypted assets (`.rpgmvp`, `.png_`, `.ogg_`, `.m4a_`…), so every player pulls those from your server. One Cache Rule fixes this.
+
+**Dashboard:** *Caching → Cache Rules → Create rule*
+
+- **If incoming requests match:** custom filter expression
+
+  ```
+  starts_with(http.request.uri.path, "/play/")
+  ```
+- **Cache eligibility:** Eligible for cache.
+- **Edge TTL:** *Use cache-control header if present, bypass cache if not*. Immutable files stay at the edge. Pages and engine scripts marked `no-cache` are revalidated with the server, which answers `304`.
+- **Browser TTL:** *Respect origin TTL*.
+
+Then *Caching → Configuration → Browser Cache TTL* → **Respect Existing Headers**. Any other value makes Cloudflare replace `no-cache` with its own `max-age`. Players would then keep an old `index.html` and runtime for up to that long after you upgrade rpgm-web.
+
+Also recommended:
+
+- *Caching → Tiered Cache → Smart Tiered Caching*: on (free). Edge locations fill from one another instead of all asking your server.
+- *Speed → Optimization*: nothing to turn off. Rocket Loader would hang games on a black screen by reordering their scripts. The server prevents that: every game script is marked `data-cfasync="false"` and responses carry `no-transform`. That also keeps Polish and Mirage off the game files.
+
+**The same through the API** (token with *Zone → Cache Rules → Edit* and *Zone Settings → Edit*):
+
+```bash
+ZONE=your-zone-id; TOKEN=your-api-token
+API=https://api.cloudflare.com/client/v4/zones/$ZONE
+
+# Cache rule. PUT replaces the zone's cache rules: if you already have some,
+# add this rule in the dashboard instead.
+curl -X PUT "$API/rulesets/phases/http_request_cache_settings/entrypoint" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  --data '{
+    "rules": [{
+      "description": "rpgm-web: cache game files",
+      "expression": "starts_with(http.request.uri.path, \"/play/\")",
+      "action": "set_cache_settings",
+      "action_parameters": {
+        "cache": true,
+        "edge_ttl": { "mode": "bypass_by_default" },
+        "browser_ttl": { "mode": "respect_origin" }
+      }
+    }]
+  }'
+
+# Browser Cache TTL: respect existing headers
+curl -X PATCH "$API/settings/browser_cache_ttl" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data '{"value":0}'
+
+# Smart Tiered Caching
+curl -X PATCH "$API/cache/tiered_cache_smart_topology_enable" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data '{"value":"on"}'
+```
+
+Check it: request a JSON file twice and look for `cf-cache-status: HIT`:
+
+```bash
+curl -sI https://games.example.com/play/<id>/r1/data/System.json | grep -i cf-cache-status
+```
+
+Limits: the free plan caches files up to 512 MB and accepts uploads up to 100 MB. Import larger archives with the CLI on the server.
+
+### What players download
+
+Not the whole game. Like the desktop build, the engine loads each image, sound and map when it first needs it. The browser keeps them in its cache, so the next session starts almost instantly.
+
+- **Haven** (MZ, 437 MB on disk): about **4.4 MB** to reach the title screen (27 MB before compression).
+- **Starscribed** (MV, 1.3 GB on disk): about **36 MB**. Most of that is images that one of its plugins preloads on purpose.
+
+After that, each new map, battle or cutscene pulls only its own files. A game can preload more through its plugins, exactly as it would on the desktop.
 
 ## Saves
 

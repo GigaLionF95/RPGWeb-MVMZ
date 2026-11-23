@@ -85,7 +85,7 @@ export class Library {
   }
 
   /** Atomically put a prepared game root in place (moves the directory). */
-  async install(id, srcRoot, files, meta) {
+  async install(id, srcRoot, files, meta, { preDir } = {}) {
     const dir = this.gameDir(id);
     await fsp.mkdir(dir, { recursive: true });
     const finalRoot = this.rootDir(id);
@@ -96,7 +96,16 @@ export class Library {
       await fsp.rename(srcRoot, finalRoot);
     } catch (e) {
       if (e.code !== 'EXDEV') throw e;
-      await fsp.cp(srcRoot, finalRoot, { recursive: true });
+      await fsp.cp(srcRoot, finalRoot, { recursive: true, preserveTimestamps: true });
+    }
+    // Precompressed copies belong to this exact tree: replace or drop them.
+    const pre = path.join(dir, 'precompressed');
+    await fsp.rm(pre, { recursive: true, force: true });
+    if (preDir) {
+      try { await fsp.rename(preDir, pre); } catch (e) {
+        if (e.code !== 'EXDEV') throw e;
+        await fsp.cp(preDir, pre, { recursive: true });
+      }
     }
     await fsp.writeFile(path.join(dir, 'files.json'), JSON.stringify(files));
     await this.writeMeta(id, meta);
