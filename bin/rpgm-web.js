@@ -14,12 +14,13 @@ const HELP = `rpgm-web — run RPG Maker MV/MZ games in the browser
 Usage:
   rpgm-web serve  [--port 8080] [--host 0.0.0.0] [--data ./data] [--api-only]
   rpgm-web import <archive-or-folder> [--id my-game] [--title "Title"] [--transcode auto|off|audio|video]
-                  [--no-precompress]
+                  [--no-precompress] [--no-webp]
   rpgm-web list
   rpgm-web info   <id>
   rpgm-web remove <id>
   rpgm-web refresh <id>|--all       re-detect resolution, cover art, media; rebuild
-                                    precompressed .br/.gz copies (--no-precompress to skip)
+                                    precompressed .br/.gz copies (--no-precompress to skip);
+                                    large PNGs → lossless WebP (--no-webp to skip)
   rpgm-web cover  <id> <image.png|jpg|webp> | --remove
   rpgm-web token          print the admin API token
   rpgm-web nginx-snippet [--root /path/to/data/games]
@@ -30,7 +31,8 @@ Environment: RPGM_DATA, RPGM_PORT, RPGM_HOST, RPGM_ADMIN_TOKEN, RPGM_FFMPEG,
              RPGM_FRAME_ANCESTORS, RPGM_PRECOMPRESS (1/0), RPGM_MAX_UNPACKED_GB,
              RPGM_MAX_FILES, RPGM_IMPORT_CONCURRENCY, RPGM_WORKERS (auto|N), RPGM_UPSTREAM (replica of
              this primary), RPGM_SYNC_INTERVAL (seconds), RPGM_REPLICAS (all|N),
-             RPGM_ADVERTISE_URL, RPGM_NODE_TIMEOUT (seconds), RPGM_ACCEL (1/0)
+             RPGM_ADVERTISE_URL, RPGM_NODE_TIMEOUT (seconds), RPGM_ACCEL (1/0),
+             RPGM_WEBP (1/0), RPGM_CWEBP, RPGM_PRELOAD (live2d|off)
 `;
 
 const { values: opt, positionals } = parseArgs({
@@ -47,6 +49,7 @@ const { values: opt, positionals } = parseArgs({
     'api-only': { type: 'boolean' },
     remove: { type: 'boolean' },
     'no-precompress': { type: 'boolean' },
+    'no-webp': { type: 'boolean' },
     root: { type: 'string' },
   },
 });
@@ -110,6 +113,7 @@ try {
       const meta = await importGame(lib, path.resolve(args[0]), {
         id: opt.id, title: opt.title, transcode: opt.transcode,
         precompress: !opt['no-precompress'] && config.precompress,
+        webp: !opt['no-webp'] && config.webp,
         limits: config.limits,
         threads: Math.min(4, os.availableParallelism?.() || os.cpus().length),
         log: (m) => { if (lastLine) process.stderr.write('\n'); lastLine = ''; console.log('•', m); },
@@ -147,6 +151,7 @@ try {
       for (const id of ids) {
         const m = await refreshGame(lib, id, {
           precompress: !opt['no-precompress'] && config.precompress,
+          webp: !opt['no-webp'] && config.webp,
           threads: Math.min(4, os.availableParallelism?.() || os.cpus().length),
           log: (msg) => console.log('  •', msg),
         });

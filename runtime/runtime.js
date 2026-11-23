@@ -222,6 +222,130 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Asset loading progress (shown by the overlay while a burst of loads runs)
+  // ---------------------------------------------------------------------------
+  var BASE_PATH = location.pathname.replace(/[^/]*$/, '');
+  /** Game-relative path of a URL on this server, or null. */
+  function gamePath(u) {
+    try {
+      var x = new URL(String(u), location.href);
+      if (x.origin !== HERE || x.pathname.indexOf(BASE_PATH) !== 0) return null;
+      var rel = decodeURIComponent(x.pathname.slice(BASE_PATH.length));
+      return rel && rel.indexOf('__rpgm/') !== 0 ? rel : null;
+    } catch (e) { return null; }
+  }
+  var loads = { active: 0, count: 0, done: 0, bytes: 0, loaded: 0, since: 0, onChange: null, preload: null };
+  function changed() { if (loads.onChange) loads.onChange(); }
+  /** Start tracking one download; returns { progress(n), end() }. */
+  function startBatch() { if (!loads.active) { loads.count = loads.done = loads.bytes = loads.loaded = 0; loads.since = Date.now(); } }
+  var pre = null; // preload: { pending: Map(lower path -> entry), inflight: Set }
+  function track(u, counted) {
+    var rel = gamePath(u);
+    if (rel === null) return null;
+    var key = rel.toLowerCase();
+    if (pre && !counted) {
+      // The game wants a file the preload has queued or is fetching: one download, counted once.
+      if (pre.inflight.has(key)) return null;
+      if (pre.pending.has(key)) { pre.pending.delete(key); loads.preload.done++; counted = true; }
+    }
+    var entry = manifest.get(key);
+    var size = entry ? entry.size : 0;
+    startBatch();
+    loads.active++;
+    if (!counted) { loads.count++; loads.bytes += size; } // the preload adds its whole queue up front
+    var got = 0, ended = false;
+    changed();
+    return {
+      progress: function (n) { if (ended || !(n > got)) return; loads.loaded += Math.min(n, size || n) - got; got = Math.min(n, size || n); },
+      end: function () {
+        if (ended) return;
+        ended = true;
+        loads.loaded += Math.max(0, size - got);
+        loads.active--; loads.done++;
+        changed();
+      },
+    };
+  }
+  R.loads = loads;
+  (function () {
+    var XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) { this.__rpgmUrl = u; return XO.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function () {
+      var t = this.__rpgmUrl != null && track(this.__rpgmUrl);
+      if (t) {
+        this.addEventListener('progress', function (e) { t.progress(e.loaded); });
+        this.addEventListener('loadend', t.end);
+      }
+      return XS.apply(this, arguments);
+    };
+    var F = window.fetch;
+    loads.fetch = F;
+    if (F) {
+      window.fetch = function (input) {
+        var t = track(input && input.url ? input.url : input);
+        var p = F.apply(this, arguments);
+        if (t) p.then(t.end, t.end);
+        return p;
+      };
+    }
+    var d = window.HTMLImageElement && Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    if (d && d.set) {
+      Object.defineProperty(HTMLImageElement.prototype, 'src', {
+        configurable: true, enumerable: d.enumerable, get: d.get,
+        set: function (v) {
+          var t = track(v);
+          if (t) {
+            var img = this;
+            var fin = function () { img.removeEventListener('load', fin); img.removeEventListener('error', fin); t.end(); };
+            img.addEventListener('load', fin); img.addEventListener('error', fin);
+          }
+          d.set.call(this, v);
+        },
+      });
+    }
+  })();
+
+  /**
+   * Preload (server setting, per game): download files under these folders in
+   * the background, a few at a time, so the browser cache has them before the
+   * game asks. Live2D games often load every model at the title screen.
+   */
+  function startPreload(prefixes) {
+    if (!prefixes || !prefixes.length || !loads.fetch || params.get('preload') === '0') return;
+    var lower = prefixes.map(function (p) { return p.toLowerCase(); });
+    var queue = [];
+    manifest.forEach(function (e, k) { if (lower.some(function (p) { return k.indexOf(p) === 0; })) queue.push(e); });
+    if (!queue.length) return;
+    var total = queue.reduce(function (a, e) { return a + e.size; }, 0);
+    loads.preload = { files: queue.length, bytes: total, done: 0 };
+    startBatch();
+    loads.count += queue.length; loads.bytes += total;
+    log('preloading', queue.length, 'files', total);
+    pre = { pending: new Map(queue.map(function (e) { return [e.path.toLowerCase(), e]; })), inflight: new Set() };
+    var url = function (p) { return BASE_PATH + p.split('/').map(encodeURIComponent).join('/'); };
+    var worker = function () {
+      var e;
+      while ((e = queue.shift()) && !pre.pending.has(e.path.toLowerCase())) { /* the game took it */ }
+      if (!e) return Promise.resolve();
+      var key = e.path.toLowerCase();
+      pre.pending.delete(key); pre.inflight.add(key);
+      var t = track(url(e.path), true);
+      return loads.fetch.call(window, url(e.path), { priority: 'low' }).then(function (r) {
+        if (!r.body || !r.body.getReader) return r.arrayBuffer();
+        var rd = r.body.getReader(), n = 0;
+        var pump = function () { return rd.read().then(function (c) { if (c.done) return; n += c.value.length; if (t) t.progress(n); return pump(); }); };
+        return pump();
+      }).catch(function () { /* the game will ask again */ }).then(function () {
+        pre.inflight.delete(key);
+        if (t) t.end();
+        loads.preload.done++;
+        return worker();
+      });
+    };
+    for (var i = 0; i < 3; i++) worker();
+  }
+
+  // ---------------------------------------------------------------------------
   // Buffer-ish helper (returned by fs reads; not installed globally)
   // ---------------------------------------------------------------------------
   var te = new TextEncoder();
@@ -869,6 +993,7 @@
     });
   }
   var readyPromise = Promise.all([storageLoad(), loadManifest()]).then(function () { ready = true; log('storage ready', mem.size, 'keys'); });
+  readyPromise.then(function () { startPreload(CFG.preload); });
   R.ready = readyPromise;
   var origAdd = window.addEventListener;
   var origRemove = window.removeEventListener;
@@ -1236,6 +1361,9 @@
       '.panel .row button:hover{filter:brightness(1.1)}' +
       '.panel .note{font-size:12.5px;color:#9a9aa6;margin:0}' +
       '.panel .x{position:absolute;top:10px;right:10px;width:30px;height:30px;border:0;border-radius:15px;background:none;color:#bbb;font-size:20px;line-height:1;cursor:pointer}.panel .x:hover{background:rgba(255,255,255,.1);color:#fff}' +
+      '.loading{pointer-events:none;position:fixed;right:calc(10px + env(safe-area-inset-right,0px));bottom:calc(10px + env(safe-area-inset-bottom,0px));display:flex;flex-direction:column;gap:5px;min-width:150px;' +
+      'background:rgba(16,16,20,.72);color:#ddd;font:12px/1.2 system-ui,sans-serif;padding:7px 10px 8px;border-radius:9px;opacity:0;transition:opacity .3s;font-variant-numeric:tabular-nums}' +
+      '.loading.on{opacity:1}.loading i{display:block;height:3px;border-radius:2px;background:rgba(255,255,255,.15);overflow:hidden}.loading b{display:block;height:100%;width:0;background:#f0a35e;transition:width .2s}' +
       '.drop{pointer-events:none;position:fixed;inset:12px;border:3px dashed rgba(240,163,94,.9);border-radius:16px;background:rgba(13,11,18,.78);color:#fff;display:grid;place-items:center;font:600 18px system-ui,sans-serif;text-align:center;padding:20px}' +
       '</style>' +
       '<button class="btn" part="btn" aria-label="Menu" title="Menu"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg></button>' +
@@ -1259,6 +1387,7 @@
       '<button class="x" data-p="close" aria-label="Close">\u00d7</button>' +
       '</div>' +
       '<div class="drop" hidden>Drop your save folder here to import it</div>' +
+      '<div class="loading" role="status" aria-live="off"><span></span><i><b></b></i></div>' +
       '<input type="file" class="in-files" multiple>' +
       '<input type="file" class="in-folder" webkitdirectory multiple>';
     document.body.appendChild(host);
@@ -1350,6 +1479,27 @@
       if (path.indexOf(host) >= 0) return; // a click inside the overlay itself
       menu.hidden = true;
     }, true);
+    // ---- asset loading indicator ----
+    var ld = root.querySelector('.loading'), ldText = ld.querySelector('span'), ldBar = ld.querySelector('b');
+    var mb = function (n) { return n >= 10485760 ? Math.round(n / 1048576) : (n / 1048576).toFixed(1); };
+    var ldTimer = null, ldHide = null;
+    var renderLoads = function () {
+      var busy = loads.active > 0;
+      var big = loads.bytes > 1048576 || loads.count > 10;
+      if (busy && big && Date.now() - loads.since > 800) {
+        clearTimeout(ldHide); ldHide = null;
+        var pct = loads.bytes ? Math.min(100, loads.loaded / loads.bytes * 100) : loads.done / loads.count * 100;
+        ldText.textContent = 'Loading ' + loads.done + ' / ' + loads.count + (loads.bytes ? ' \u00b7 ' + mb(loads.loaded) + ' / ' + mb(loads.bytes) + ' MB' : '');
+        ldBar.style.width = pct.toFixed(1) + '%';
+        ld.classList.add('on');
+      } else if (!busy && ld.classList.contains('on') && !ldHide) {
+        ldBar.style.width = '100%';
+        ldHide = setTimeout(function () { ld.classList.remove('on'); ldHide = null; }, 500);
+      }
+      if (busy && !ldTimer) ldTimer = setInterval(renderLoads, 250);
+      if (!busy && ldTimer) { clearInterval(ldTimer); ldTimer = null; }
+    };
+    if (params.get('loading') !== '0') { loads.onChange = renderLoads; renderLoads(); }
     var mo = new MutationObserver(function () {
       if (muted) R.applyMute && R.applyMute();
       if (document.body.lastElementChild !== host) document.body.appendChild(host); // keep last in stacking order

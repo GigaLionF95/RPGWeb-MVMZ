@@ -20,6 +20,7 @@ MV/MZ games are HTML5 apps wrapped in NW.js (Chromium + Node). rpgm-web drops th
 | `require('nw.gui')`, `nw.Window`, `process`, `os`, `path`, `child_process` | compatible shims: fullscreen, opening links, clipboard; "quit game" returns to the library |
 | the window is sized to the game | the game is stretched to the browser window, keeping its aspect ratio, as on the desktop |
 | MV picks `.m4a`/`.mp4` on phones | missing `.m4a`/`.mp4` files are generated with ffmpeg at import time (keeping the game's encryption); the browser picks a format it can play |
+| assets come from the local disk | large PNGs become lossless WebP at import (same pixels, about half the download; file names and encryption unchanged), a progress indicator shows while big batches load, and Live2D models can preload in the background |
 | fullscreen and video autoplay just work | browser policies (Firefox, Safari) are handled: refused requests are retried on the first click instead of crashing MZ |
 
 The importer understands:
@@ -102,7 +103,7 @@ The library lives in a Docker volume named `rpgm-data`. `docker compose down` ke
 
 ### Option B: Node.js, without Docker
 
-**1. Install Node.js 20 or newer** from <https://nodejs.org/> and check it with `node -v`. Optional: `ffmpeg` (converts audio/video for phones at import) and `bsdtar` (opens `.7z` and `.rar`).
+**1. Install Node.js 20 or newer** from <https://nodejs.org/> and check it with `node -v`. Optional: `ffmpeg` (converts audio/video for phones at import), `bsdtar` (opens `.7z` and `.rar`) and `cwebp` from the `webp` package (shrinks large images at import). The Docker image has all three.
 
 **2. Download rpgm-web** (step 2 of Option A) and go into its folder. There is nothing to `npm install`: rpgm-web has no dependencies.
 
@@ -123,11 +124,12 @@ Open <http://localhost:8080/>. The server stops when you close the terminal. To 
 ```
 rpgm-web serve   [--port 8080] [--host 0.0.0.0] [--data ./data] [--api-only]
 rpgm-web import  <archive-or-folder> [--id my-game] [--title "Title"] [--transcode auto|off|audio|video]
-                 [--no-precompress]
+                 [--no-precompress] [--no-webp]
 rpgm-web list
 rpgm-web info    <id>
 rpgm-web remove  <id>
-rpgm-web refresh <id> | --all                 re-detect resolution, cover art, media; rebuild precompressed files
+rpgm-web refresh <id> | --all                 re-detect resolution, cover art, media; rebuild precompressed files;
+                                              convert large PNGs to lossless WebP (games imported by older versions)
 rpgm-web cover   <id> <image.png|jpg|webp> | --remove
 rpgm-web token
 ```
@@ -237,7 +239,7 @@ Write requests need `Authorization: Bearer <token>`.
 | `POST` | `/api/games?filename=game.zip[&id=…][&title=…]` | body is the archive; replies `202 {job}` |
 | `GET` | `/api/jobs/<job>` | import status: phase, progress, log |
 | `GET` | `/api/games/<id>` | game info, including `url`, `embedUrl`, `coverUrl`, `screen` |
-| `PATCH` | `/api/games/<id>` | `{"title": "…", "hidden": true}`. `hidden` means *unlisted*: the game leaves the public list, but `/play/<id>/`, `/embed/<id>/` and `GET /api/games/<id>` keep working for anyone with the link |
+| `PATCH` | `/api/games/<id>` | `{"title": "…", "hidden": true, "preload": false}`. `preload`: Live2D preload for this game, `true`/`false`, or `null` for the server default (`RPGM_PRELOAD`). `hidden` means *unlisted*: the game leaves the public list, but `/play/<id>/`, `/embed/<id>/` and `GET /api/games/<id>` keep working for anyone with the link |
 | `DELETE` | `/api/games/<id>` | remove the game |
 | `GET` / `PUT` / `DELETE` | `/api/games/<id>/cover` | cover image (PUT body: PNG/JPEG/WebP, ≤ 10 MB) |
 | `GET` | `/play/<id>/` | play |
@@ -273,6 +275,9 @@ curl -H "Authorization: Bearer $TOKEN" --data-binary @game.zip \
 | `RPGM_NODE_TIMEOUT` | `180` | primary: seconds without contact before a server's games are placed elsewhere |
 | `RPGM_ACCEL` | `1` | `0`: ignore nginx's `X-Rpgm-Accel` and always send files from Node (see [nginx sends the files](#nginx-sends-the-files)) |
 | `RPGM_PRECOMPRESS` | `1` | `0`: skip making `.br`/`.gz` copies at import (compress on the fly only) |
+| `RPGM_WEBP` | `1` | `0`: keep large PNGs as they are (no lossless WebP at import) |
+| `RPGM_CWEBP` | `cwebp` | path to cwebp |
+| `RPGM_PRELOAD` | `live2d` | `off`: don't preload Live2D models in the background (a per-game switch is in the game's settings, see [Loading](#loading-big-games)) |
 
 ## Several servers
 
@@ -554,6 +559,14 @@ Not the whole game. Like the desktop build, the engine loads each image, sound a
 - **Starscribed** (MV, 1.3 GB on disk): about **36 MB**. Most of that is images that one of its plugins preloads on purpose.
 
 After that, each new map, battle or cutscene pulls only its own files. A game can preload more through its plugins, exactly as it would on the desktop.
+
+### Loading big games
+
+Some games load a lot up front. Hypnosis Knight-Princess loads every Live2D model it has (143 textures of 4096×4096) before its title screen. On the desktop that is a disk read; in a browser it is a download. Three things help:
+
+- **Lossless WebP at import.** PNGs over 128 KB under `img/` are re-encoded as lossless WebP when that saves at least 10%. Every pixel stays the same (checked byte for byte after decoding). File names and the game's encryption do not change, and browsers recognise the format from the file itself. Hypnosis Knight-Princess: 358 images, 280 MB less; its Live2D textures went from 525 MB to 281 MB. Animated PNGs, 16-bit PNGs and PNGs with colour profiles are left alone. Needs `cwebp` (in the Docker image); costs about 3 seconds per large image at import. For games already on the server: `rpgm-web refresh --all`. WebP needs Safari 14 / iOS 14 or newer.
+- **Loading indicator.** When a burst of loading runs longer than a moment, a small counter in the bottom-right corner shows files and megabytes, so a long first load doesn't look like a frozen game.
+- **Live2D preload** (on by default, `RPGM_PRELOAD=off` to disable; per game in the library: *Embed* → *Preload Live2D models*). For games with `img/live2d/`, the player's browser downloads the models in the background, three files at a time at low priority, so they are cached before a scene needs them. It helps games that load models scene by scene. When a game asks for everything at once, as Hypnosis Knight-Princess does, the preload simply steps aside.
 
 ## Saves
 

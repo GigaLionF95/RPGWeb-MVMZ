@@ -11,6 +11,7 @@ import { extractTar } from './tar.js';
 import { locateGame } from './locate.js';
 import { analyzeGame, listFiles } from './analyze.js';
 import { findFfmpeg, planTranscodes, runTranscodes } from './transcode.js';
+import { optimizeImages } from './webp.js';
 import { ID_RE } from '../library.js';
 import { precompressTree, precompressGame } from '../precompress.js';
 import { UnpackBudget } from './limits.js';
@@ -144,12 +145,21 @@ async function removeJunk(root) {
 export async function refreshGame(lib, id, opts = {}) {
   const g = await lib.get(id);
   if (!g) throw new Error(`no game "${id}"`);
+  let images = null;
+  if (opts.webp !== false) {
+    images = await optimizeImages(lib.rootDir(id), await listFiles(lib.rootDir(id)), g.meta, { tmpDir: lib.tmpDir, log: opts.log, concurrency: opts.threads });
+  }
   const files = await listFiles(lib.rootDir(id));
   const info = await analyzeGame(lib.rootDir(id), files);
-  const keep = ['id', 'title', 'packaging', 'source', 'importedAt', 'rev', 'transcode', 'hidden', 'coverRev', 'customCover'];
+  const keep = ['id', 'title', 'packaging', 'source', 'importedAt', 'rev', 'transcode', 'hidden', 'coverRev', 'customCover', 'images', 'preload'];
   const meta = { ...info };
   for (const k of keep) if (g.meta[k] !== undefined) meta[k] = g.meta[k];
-  await fsp.writeFile(path.join(lib.gameDir(id), 'files.json'), JSON.stringify(files));
+  if (images?.converted) meta.images = { converted: images.converted + (g.meta.images?.converted || 0), savedBytes: images.savedBytes + (g.meta.images?.savedBytes || 0) };
+  // New file + rename (never rewrite in place: the server may be reading it,
+  // and a hard-linked copy of the game must not change with it).
+  const listFile = path.join(lib.gameDir(id), 'files.json');
+  await fsp.writeFile(listFile + '.new', JSON.stringify(files));
+  await fsp.rename(listFile + '.new', listFile);
   await lib.writeMeta(id, meta);
   if (opts.precompress !== false) await precompressGame(lib, id, { log: opts.log, concurrency: opts.threads });
   return meta;
@@ -220,6 +230,16 @@ export async function importGame(lib, source, opts = {}) {
       }
     }
 
+    // Large PNGs → lossless WebP (same pixels, about half the download).
+    let images = null;
+    if (opts.webp !== false) {
+      images = await optimizeImages(staged, files, info, {
+        tmpDir: work, log, concurrency: opts.threads,
+        onProgress: (d, t) => progress('images', d, t, 'Optimizing images'),
+      });
+      if (images?.converted) files = await listFiles(staged);
+    }
+
     let id = opts.id;
     if (id && !ID_RE.test(id)) throw new Error('id must match ' + ID_RE);
     if (!id) id = await lib.uniqueId(opts.title || info.title);
@@ -233,6 +253,7 @@ export async function importGame(lib, source, opts = {}) {
       importedAt: new Date().toISOString(),
       rev: (prev?.meta?.rev || 0) + 1,
       transcode,
+      ...(images ? { images } : {}),
       hidden: prev?.meta?.hidden || false,
     };
     // Text assets compressed once now, so serving them costs no CPU.

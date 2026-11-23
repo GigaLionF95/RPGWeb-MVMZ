@@ -105,6 +105,8 @@ export async function analyzeGame(root, files) {
     screen: { width, height },
     icon: has('icon/icon.png') || null,
     titleArt,
+    // Live2D models (img/live2d/): the player can preload them in the background.
+    live2d: files.some(([p]) => /^img\/live2d\//i.test(p)),
     media,
     fileCount: files.length,
     totalBytes: files.reduce((s, [, n]) => s + n, 0),

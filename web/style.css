@@ -180,3 +180,8 @@ input:focus { outline: none; border-color: var(--ember); box-shadow: 0 0 0 3px r
   .bar .btn { width: 40px; padding: 0; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+.preload-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13.5px; color: var(--muted, #aaa); cursor: pointer; }
+.preload-row[hidden] { display: none; }
+.preload-row input { accent-color: #f0a35e; width: 16px; height: 16px; margin: 0; }
+.preload-note { opacity: .7; }

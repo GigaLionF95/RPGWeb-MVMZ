@@ -1,7 +1,8 @@
 FROM node:22-alpine
 
-# ffmpeg: mobile audio/video conversion at import; libarchive-tools: 7z/rar via bsdtar
-RUN apk add --no-cache ffmpeg libarchive-tools tini
+# ffmpeg: mobile audio/video conversion at import; libarchive-tools: 7z/rar via bsdtar;
+# libwebp-tools: cwebp, large PNGs → lossless WebP at import
+RUN apk add --no-cache ffmpeg libarchive-tools libwebp-tools tini
 
 WORKDIR /app
 COPY package.json ./

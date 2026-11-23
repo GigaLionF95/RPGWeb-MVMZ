@@ -60,5 +60,10 @@ export function loadConfig(flags = {}) {
     })(),
     // Brotli/gzip copies of text files made at import (served with zero CPU).
     precompress: bool(process.env.RPGM_PRECOMPRESS, saved.precompress ?? true),
+    // Large PNGs become lossless WebP at import (needs cwebp; same pixels).
+    webp: bool(process.env.RPGM_WEBP, saved.webp ?? true),
+    // Players' browsers download Live2D models in the background ('live2d'),
+    // or only when the game asks ('off'). Per game: PATCH {"preload": true|false|null}.
+    preload: /^(off|0|false|no)$/i.test(process.env.RPGM_PRELOAD || saved.preload || '') ? 'off' : 'live2d',
   };
 }

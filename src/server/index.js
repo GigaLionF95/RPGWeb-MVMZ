@@ -385,11 +385,13 @@ export async function startServer(config, lib) {
         id, engine: meta.engine, title: meta.title, rev: meta.rev,
         mzGameId: meta.mzGameId, runtimeVersion, media: meta.media,
         library: '../../../', sandbox: config.gameSandbox !== false,
+        preload: preloadOn(meta) ? ['img/live2d/'] : null,
       };
       return sendFile(req, res, path.join(lib.rootDir(id), indexRel), {
         type: 'text/html; charset=utf-8', cacheControl: 'no-cache',
         transform: (buf) => Buffer.from(patchIndexHtml(buf.toString('utf8'), cfg)),
-        cacheKey: `index|${id}|${runtimeVersion}`, etagSeed: runtimeVersion + '-',
+        // The config above comes from meta.json: a rename or setting change is a new page.
+        cacheKey: `index|${id}|${g.mtime}|${runtimeVersion}|${config.preload}`, etagSeed: `${runtimeVersion}-${Math.floor(g.mtime).toString(36)}${config.preload === 'off' ? 'n' : ''}-`,
       });
     }
 
@@ -464,8 +466,13 @@ export async function startServer(config, lib) {
       embedUrl: `embed/${m.id}/`,
       hasCover,
       coverUrl: hasCover ? `api/games/${m.id}/cover?v=${m.coverRev || m.rev}` : null,
+      preloadDefault: config.preload === 'live2d',
+      preloadOn: preloadOn(m),
     };
   }
+
+  /** Live2D preload for this game: its own setting, else the server's. */
+  const preloadOn = (m) => !!m.live2d && (typeof m.preload === 'boolean' ? m.preload : config.preload === 'live2d');
 
   /** Cover art: custom upload, else the title screen background (decrypted). */
   async function sendCover(req, res, g) {
@@ -530,6 +537,7 @@ export async function startServer(config, lib) {
       id, title: url.searchParams.get('title') || undefined,
       transcode: url.searchParams.get('transcode') || undefined,
       precompress: config.precompress,
+      webp: config.webp,
       limits: config.limits,
       log: (m) => { job.log.push(m); if (job.log.length > 200) job.log.shift(); persistJob(job); },
       onProgress: (p) => { Object.assign(job, { phase: p.phase, done: p.done, total: p.total, message: p.message }); persistJob(job); },
@@ -642,6 +650,7 @@ export async function startServer(config, lib) {
           const patch = {};
           if (typeof body.title === 'string' && body.title.trim()) patch.title = body.title.trim().slice(0, 200);
           if (typeof body.hidden === 'boolean') patch.hidden = body.hidden;
+          if (typeof body.preload === 'boolean' || body.preload === null) patch.preload = body.preload;
           return sendJson(res, 200, publicMeta(await lib.updateMeta(id, patch)));
         }
         if (method === 'DELETE') { requireAdmin(req); await lib.remove(id); return sendJson(res, 200, { removed: id }); }

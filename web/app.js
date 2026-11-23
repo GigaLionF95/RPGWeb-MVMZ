@@ -80,6 +80,13 @@ function renderEmbed(li) {
     ? 'Custom cover image.'
     : g.hasCover ? 'Cover is the game\'s title screen art. Upload an image to replace it.' : 'No cover yet: the embed shows the game icon. Upload a 16:9 image for a nicer start screen.';
   panel.querySelector('[data-act=remove-cover]').hidden = !g.customCover;
+  const pre = panel.querySelector('.preload-row');
+  pre.hidden = !g.live2d;
+  if (g.live2d) {
+    pre.querySelector('.preload-box').checked = !!g.preloadOn;
+    pre.querySelector('.preload-note').textContent = g.preload == null
+      ? `(server default: ${g.preloadDefault ? 'on' : 'off'})` : '(set for this game)';
+  }
 }
 
 function renderGames(games) {
@@ -228,7 +235,7 @@ function upload(file) {
   xhr.send(file);
 }
 
-const PHASES = { queued: 'Waiting', extract: 'Extracting', locate: 'Finding the game', transcode: 'Converting media for phones', precompress: 'Compressing text files', install: 'Installing', done: 'Done' };
+const PHASES = { queued: 'Waiting', extract: 'Extracting', locate: 'Finding the game', transcode: 'Converting media for phones', precompress: 'Compressing text files', images: 'Optimizing images', install: 'Installing', done: 'Done' };
 
 async function poll(id) {
   let seen = 0;
@@ -287,6 +294,15 @@ $('#games').addEventListener('click', async (e) => {
       await api(`games/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hidden }) });
       await refresh();
     } else if (act === 'rename') startRename(li, id);
+  } catch (err) { setStatus(err.message); }
+});
+
+$('#games').addEventListener('change', async (e) => {
+  if (!e.target.classList.contains('preload-box')) return;
+  const li = e.target.closest('.game');
+  try {
+    await api(`games/${li.dataset.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ preload: e.target.checked }) });
+    await refresh(); reopenEmbed(li.dataset.id);
   } catch (err) { setStatus(err.message); }
 });
 
