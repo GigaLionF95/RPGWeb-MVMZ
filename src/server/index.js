@@ -11,6 +11,7 @@ import { mimeOf, isCompressible } from './mime.js';
 import { hookFor, patchScript, patchIndexHtml } from './inject.js';
 import { importGame } from '../importer/index.js';
 import { ID_RE } from '../library.js';
+import { decrypt } from '../importer/rpgcrypt.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const WEB_DIR = path.join(ROOT, 'web');
@@ -216,7 +217,43 @@ export async function startServer(config, lib) {
 
   function publicMeta(m) {
     const { encryption, ...rest } = m;
-    return { ...rest, encryption: { images: encryption?.images, audio: encryption?.audio }, url: `play/${m.id}/` };
+    const hasCover = !!(m.customCover || m.titleArt);
+    return {
+      ...rest,
+      encryption: { images: encryption?.images, audio: encryption?.audio },
+      url: `play/${m.id}/`,
+      embedUrl: `embed/${m.id}/`,
+      hasCover,
+      coverUrl: hasCover ? `api/games/${m.id}/cover?v=${m.coverRev || m.rev}` : null,
+    };
+  }
+
+  /** Cover art: custom upload, else the title screen background (decrypted). */
+  async function sendCover(req, res, g) {
+    const custom = g.meta.customCover ? await lib.customCover(g.meta.id) : null;
+    if (custom) return sendFile(req, res, custom.path, { type: custom.type, cacheControl: 'public, max-age=86400' });
+    const art = g.meta.titleArt;
+    if (!art) throw new HttpError(404, 'no cover');
+    const file = path.join(lib.rootDir(g.meta.id), art);
+    const encrypted = /\.(rpgmvp|png_)$/i.test(art);
+    if (!encrypted) return sendFile(req, res, file, { type: 'image/png', cacheControl: 'public, max-age=86400' });
+    const key = g.meta.encryption?.key;
+    if (!key) throw new HttpError(404, 'no cover');
+    return sendFile(req, res, file, {
+      type: 'image/png', cacheControl: 'public, max-age=86400',
+      transform: (buf) => decrypt(buf, key), cacheKey: `cover|${g.meta.id}`,
+    });
+  }
+
+  async function handleCoverUpload(req, res, id) {
+    requireAdmin(req);
+    const types = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
+    const ext = types[String(req.headers['content-type'] || '').split(';')[0].trim()];
+    if (!ext) throw new HttpError(415, 'cover must be PNG, JPEG or WebP');
+    const chunks = []; let n = 0;
+    for await (const c of req) { n += c.length; if (n > 10 * 1024 * 1024) throw new HttpError(413, 'cover is larger than 10 MB'); chunks.push(c); }
+    await lib.setCover(id, Buffer.concat(chunks), ext);
+    return sendJson(res, 200, publicMeta((await lib.get(id)).meta));
   }
 
   async function handleUpload(req, res, url) {
@@ -264,7 +301,7 @@ export async function startServer(config, lib) {
     if (parts[0] === 'games' && parts.length === 1) {
       if (method === 'GET') {
         const admin = isAdmin(req);
-        if (!config.publicLibrary && !admin) throw new HttpError(401, 'admin token required');
+        if ((!config.publicLibrary || config.apiOnly) && !admin) throw new HttpError(401, 'admin token required');
         const games = (await lib.list()).filter((g) => admin || !g.hidden).map(publicMeta);
         return sendJson(res, 200, { games, admin });
       }
@@ -278,8 +315,13 @@ export async function startServer(config, lib) {
         if (!g.meta.icon) throw new HttpError(404, 'no icon');
         return sendFile(req, res, path.join(lib.rootDir(id), g.meta.icon), { cacheControl: 'public, max-age=3600' });
       }
+      if (parts[2] === 'cover' && parts.length === 3) {
+        if (method === 'GET' || method === 'HEAD') return sendCover(req, res, g);
+        if (method === 'PUT' || method === 'POST') return handleCoverUpload(req, res, id);
+        if (method === 'DELETE') { requireAdmin(req); await lib.removeCover(id, { updateMeta: true }); return sendJson(res, 200, publicMeta((await lib.get(id)).meta)); }
+      }
       if (parts.length === 2) {
-        if (method === 'GET') return sendJson(res, 200, publicMeta(g.meta));
+        if (method === 'GET') { res.setHeader('Access-Control-Allow-Origin', '*'); return sendJson(res, 200, publicMeta(g.meta)); }
         if (method === 'PATCH') {
           requireAdmin(req);
           const body = await readJsonBody(req);
@@ -300,6 +342,35 @@ export async function startServer(config, lib) {
     throw new HttpError(404, 'unknown endpoint');
   }
 
+  // ---- embeds ----------------------------------------------------------------
+  /** Games and the embed page may be framed (as configured); the admin UI may not. */
+  function setFrameHeaders(res, embeddable) {
+    if (!embeddable) {
+      res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+      res.setHeader('Content-Security-Policy', "frame-ancestors 'self'");
+    } else if (config.frameAncestors && config.frameAncestors !== '*') {
+      res.setHeader('Content-Security-Policy', `frame-ancestors 'self' ${config.frameAncestors}`);
+    }
+  }
+
+  async function serveEmbed(req, res, id) {
+    const g = await lib.get(id);
+    if (!g) throw new HttpError(404, 'game not found');
+    const m = publicMeta(g.meta);
+    const cfg = {
+      id, title: m.title, engine: m.engine, engineVersion: m.engineVersion, screen: m.screen,
+      cover: m.coverUrl ? `../../${m.coverUrl}` : null,
+      icon: m.icon ? `../../api/games/${id}/icon` : null,
+      play: `../../play/${id}/?embed=1`,
+      open: `../../play/${id}/`,
+    };
+    return sendFile(req, res, path.join(WEB_DIR, 'embed.html'), {
+      type: 'text/html; charset=utf-8', cacheControl: 'no-cache',
+      transform: (buf) => Buffer.from(buf.toString('utf8').replace('/*RPGM_EMBED*/null', JSON.stringify(cfg).replace(/</g, '\\u003c'))),
+      cacheKey: `embed|${id}|${g.mtime}`, etagSeed: `e${Math.floor(g.mtime).toString(36)}-`,
+    });
+  }
+
   // ---- router ----------------------------------------------------------------
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
@@ -312,10 +383,27 @@ export async function startServer(config, lib) {
       if (p === '/healthz') return sendJson(res, 200, { ok: true, version: PKG.version });
       const play = /^\/play\/([^/]+)(?:\/(.*))?$/s.exec(p);
       if (play) {
-        if (play[2] === undefined) { res.writeHead(301, { Location: `${play[1]}/` }); return res.end(); }
+        if (play[2] === undefined) { res.writeHead(301, { Location: `${play[1]}/${url.search}` }); return res.end(); }
+        setFrameHeaders(res, true);
         return await serveGame(req, res, play[1], play[2], url.search);
       }
-      if (p === '/' || p === '/index.html') return await sendFile(req, res, path.join(WEB_DIR, 'index.html'), { cacheControl: 'no-cache' });
+      const embed = /^\/embed\/([^/]+)(\/)?$/.exec(p);
+      if (embed) {
+        if (!embed[2]) { res.writeHead(301, { Location: `${embed[1]}/${url.search}` }); return res.end(); }
+        setFrameHeaders(res, true);
+        return await serveEmbed(req, res, embed[1]);
+      }
+      if (p === '/sdk/rpgm-embed.js') {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        return await sendFile(req, res, path.join(WEB_DIR, 'sdk.js'), { cacheControl: 'public, max-age=3600' });
+      }
+      if (config.apiOnly && (p === '/' || p === '/index.html' || p.startsWith('/assets/'))) {
+        throw new HttpError(404, 'this server runs in API-only mode (no library page)');
+      }
+      if (p === '/' || p === '/index.html') {
+        setFrameHeaders(res, false);
+        return await sendFile(req, res, path.join(WEB_DIR, 'index.html'), { cacheControl: 'no-cache' });
+      }
       const asset = /^\/assets\/([\w.-]+)$/.exec(p);
       if (asset) return await sendFile(req, res, path.join(WEB_DIR, asset[1]), { cacheControl: 'no-cache' });
       throw new HttpError(404, 'not found');

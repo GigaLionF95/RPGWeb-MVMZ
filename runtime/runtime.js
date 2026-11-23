@@ -63,8 +63,49 @@
     });
   }
 
+  // Cloud saves: when the embedding site opted in (iframe URL has cloud=1),
+  // the site stores saves under its own accounts via the postMessage bridge
+  // (see web/sdk.js). Then the site, not this browser, is the storage.
+  var CLOUD_WANTED = params.get('cloud') === '1' && window.parent !== window;
+  var cloud = { active: false, timer: null, seq: 0, lastError: null };
+  function postParent(msg) {
+    msg.rpgm = 1; msg.game = GAME_ID;
+    try { window.parent.postMessage(msg, '*'); } catch (e) { /* detached */ }
+  }
+  function cloudSnapshot() {
+    var entries = {};
+    mem.forEach(function (v, k) { entries[k] = encodeValue(v); });
+    return { format: 'rpgm-web-saves', version: 1, game: GAME_ID, title: CFG.title, engine: CFG.engine, savedAt: new Date().toISOString(), entries: entries };
+  }
+  function cloudPush() {
+    cloud.timer = null;
+    postParent({ type: 'save', seq: ++cloud.seq, data: cloudSnapshot() });
+  }
+  function cloudLoad() {
+    return new Promise(function (resolve) {
+      var done = false;
+      function onMsg(e) {
+        var d = e.data;
+        if (e.source !== window.parent || !d || d.rpgm !== 1 || d.type !== 'saves' || d.game !== GAME_ID) return;
+        done = true;
+        removeEventListener('message', onMsg);
+        resolve(d);
+      }
+      addEventListener('message', onMsg);
+      postParent({ type: 'hello', cloud: true, title: CFG.title, engine: CFG.engine });
+      setTimeout(function () { if (!done) { removeEventListener('message', onMsg); resolve({ error: 'the site did not answer' }); } }, 10000);
+    });
+  }
+
   function flush() {
     flushTimer = null;
+    if (cloud.active) {
+      if (!dirty.size) return;
+      dirty = new Map();
+      if (cloud.timer) clearTimeout(cloud.timer);
+      cloud.timer = setTimeout(cloudPush, 800);
+      return;
+    }
     if (!db || !dirty.size) return;
     var batch = dirty;
     dirty = new Map();
@@ -90,8 +131,12 @@
     mem.forEach(function (_, k) { if (k.lastIndexOf(prefix, 0) === 0) out.push(k.slice(prefix.length)); });
     return out;
   }
-  addEventListener('pagehide', flush);
-  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') flush(); });
+  function flushNow() {
+    flush();
+    if (cloud.active && cloud.timer) { clearTimeout(cloud.timer); cloudPush(); }
+  }
+  addEventListener('pagehide', flushNow);
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') flushNow(); });
   R.store = { get: kvGet, set: kvSet, del: kvDel, keys: kvKeys, flush: flush };
 
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) { /* optional */ }
@@ -505,7 +550,22 @@
     if (fn && isFullscreen()) { try { var p = fn.call(document); if (p && p.catch) p.catch(function () {}); } catch (e) { /* ignore */ } }
   }
   function toggleFullscreen() { if (isFullscreen()) exitFullscreen(); else enterFullscreen(); }
-  function backToLibrary() { flush(); location.href = CFG.library || '/'; }
+  // Embedded on another site (iframe from /embed/<id>/): leaving the game
+  // returns to the embed's cover screen instead of the library.
+  var EMBED = params.get('embed') === '1';
+  var ROOT = CFG.library || '/';
+  function backToLibrary() {
+    flushNow();
+    if (!EMBED) { location.href = ROOT; return; }
+    postParent({ type: 'exit' });
+    var keep = new URLSearchParams();
+    ['mute', 'cloud'].forEach(function (k) { if (params.get(k)) keep.set(k, params.get(k)); });
+    location.href = ROOT + 'embed/' + encodeURIComponent(GAME_ID) + '/' + (keep.toString() ? '?' + keep : '');
+  }
+  function openInNewTab() {
+    flushNow();
+    try { window.open(ROOT + 'play/' + encodeURIComponent(GAME_ID) + '/', '_blank', 'noopener'); } catch (e) { /* blocked */ }
+  }
 
   // ---------------------------------------------------------------------------
   // nw.gui / nw shim
@@ -738,7 +798,22 @@
   // Hold the game's start until saves + manifest are loaded
   // ---------------------------------------------------------------------------
   var ready = false;
-  var readyPromise = Promise.all([idbLoad(), loadManifest()]).then(function () { ready = true; log('storage ready', mem.size, 'keys'); });
+  function storageLoad() {
+    if (!CLOUD_WANTED) return idbLoad();
+    return cloudLoad().then(function (r) {
+      if (r.error) {
+        cloud.lastError = r.error;
+        console.warn('[rpgm-web] cloud saves unavailable (' + r.error + '); saving in this browser instead');
+        R.cloudFallback = true;
+        return idbLoad();
+      }
+      cloud.active = true;
+      var entries = r.data && r.data.entries;
+      if (entries && typeof entries === 'object') Object.keys(entries).forEach(function (k) { mem.set(k, decodeValue(entries[k])); });
+      log('cloud saves loaded', mem.size, 'keys');
+    });
+  }
+  var readyPromise = Promise.all([storageLoad(), loadManifest()]).then(function () { ready = true; log('storage ready', mem.size, 'keys'); });
   R.ready = readyPromise;
   var origAdd = window.addEventListener;
   var origRemove = window.removeEventListener;
@@ -836,6 +911,7 @@
   function beforeStart() {
     if (started) return;
     started = true;
+    if (window.parent !== window) postParent({ type: 'started', cloud: cloud.active });
     // Save the way the desktop build would: evaluate the final isLocalMode
     // chain (engine + plugins such as VisuMZ SaveCore) as if under NW.js, so
     // files land under save/ in our fs with desktop paths and semantics.
@@ -949,6 +1025,8 @@
       '.menu{pointer-events:auto;position:fixed;top:calc(48px + env(safe-area-inset-top,0px));left:calc(8px + env(safe-area-inset-left,0px));min-width:210px;background:rgba(24,24,28,.94);color:#eee;border-radius:10px;padding:6px;' +
       'font:14px/1.3 system-ui,sans-serif;box-shadow:0 8px 30px rgba(0,0,0,.5);backdrop-filter:blur(8px)}' +
       '.menu[hidden]{display:none}' +
+      '.menu{max-height:calc(100vh - 56px - env(safe-area-inset-top,0px));overflow-y:auto;overscroll-behavior:contain}' +
+      '@media (max-height:440px){.menu{top:calc(6px + env(safe-area-inset-top,0px));left:calc(48px + env(safe-area-inset-left,0px));max-height:calc(100vh - 12px)}.menu button,.menu label{padding:6px 10px}.menu .title{display:none}.menu hr{margin:2px 6px}}' +
       '.menu button,.menu label{display:block;width:100%;text-align:left;background:none;border:0;color:inherit;font:inherit;padding:9px 12px;border-radius:7px;cursor:pointer;box-sizing:border-box}' +
       '.menu button:hover,.menu label:hover{background:rgba(255,255,255,.1)}' +
       '.menu hr{border:0;border-top:1px solid rgba(255,255,255,.12);margin:4px 6px}' +
@@ -963,7 +1041,9 @@
       '<button data-a="mute"></button>' +
       '<hr><button data-a="export">Export saves</button>' +
       '<label>Import saves…<input type="file" multiple accept=".json,.rpgsave,.rmmzsave"></label>' +
-      '<hr><button data-a="library">Back to library</button>' +
+      (EMBED
+        ? '<hr><button data-a="newtab">Open in new tab</button><button data-a="library">Exit game</button>'
+        : '<hr><button data-a="library">Back to library</button>') +
       '</div>';
     document.body.appendChild(host);
     var btn = root.querySelector('.btn'), menu = root.querySelector('.menu'), input = root.querySelector('input');
@@ -971,10 +1051,13 @@
     var muteBtn = root.querySelector('[data-a=mute]');
     var setMuteLabel = function () { muteBtn.textContent = muted ? 'Sound: off' : 'Sound: on'; };
     setMuteLabel();
-    var toast = function (msg) {
+    var toast = function (msg, ms) {
       var t = document.createElement('div'); t.className = 'toast'; t.textContent = msg; root.appendChild(t);
-      setTimeout(function () { t.remove(); }, 2600);
+      setTimeout(function () { t.remove(); }, ms || 2600);
     };
+    readyPromise.then(function () {
+      if (R.cloudFallback) toast('Cloud saves are unavailable right now. Progress is saved in this browser only.', 7000);
+    });
     var hideTimer = null;
     var reveal = function () { btn.classList.add('show'); clearTimeout(hideTimer); hideTimer = setTimeout(function () { if (menu.hidden) btn.classList.remove('show'); }, 2500); };
     origAdd.call(window, 'mousemove', function (e) { if (e.clientX < 120 && e.clientY < 120) reveal(); }, { passive: true });
@@ -993,6 +1076,7 @@
         setMuteLabel();
       } else if (a === 'export') { exportSaves(); toast('Saves exported'); }
       else if (a === 'library') backToLibrary();
+      else if (a === 'newtab') openInNewTab();
       menu.hidden = true;
     });
     input.addEventListener('change', function () {
@@ -1005,7 +1089,12 @@
       menu.hidden = true;
     });
     // Close the menu when the game is clicked.
-    origAdd.call(window, 'pointerdown', function () { if (!menu.hidden) menu.hidden = true; }, true);
+    origAdd.call(window, 'pointerdown', function (e) {
+      if (menu.hidden) return;
+      var path = e.composedPath ? e.composedPath() : [];
+      if (path.indexOf(host) >= 0) return; // a click inside the overlay itself
+      menu.hidden = true;
+    }, true);
     var mo = new MutationObserver(function () {
       if (muted) R.applyMute && R.applyMute();
       if (document.body.lastElementChild !== host) document.body.appendChild(host); // keep last in stacking order

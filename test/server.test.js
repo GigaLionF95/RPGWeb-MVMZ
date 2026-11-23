@@ -77,3 +77,56 @@ test('admin API: auth, upload, rename, hide, delete', async () => {
   assert.equal((await fetch(`${base}/play/uploaded/r1/`)).status, 404);
   await assert.rejects(fsp.access(path.join(lib.gamesDir, 'uploaded')));
 });
+
+test('embed page, frame policy and cover art', async () => {
+  const { encrypt } = await import('../src/importer/rpgcrypt.js');
+  const key = '00112233445566778899aabbccddeeff';
+  const png = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('fake-png-body-0123456789')]);
+  const dir = await makeGame(path.join(work, 'emb'), 'mz', {
+    title: 'Embed Me',
+    extra: {
+      'data/System.json': JSON.stringify({ gameTitle: 'Embed Me', title1Name: 'Castle', hasEncryptedImages: true, encryptionKey: key, advanced: { gameId: 7, screenWidth: 1280, screenHeight: 720 } }),
+      'img/titles1/Castle.png_': encrypt(png, key),
+    },
+  });
+  await importGame(lib, dir, { id: 'emb', transcode: 'off' });
+
+  const page = await fetch(`${base}/embed/emb/`);
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get('x-frame-options'), null, 'embeds can be framed');
+  const html = await page.text();
+  assert.match(html, /"play":"\.\.\/\.\.\/play\/emb\/\?embed=1"/);
+  assert.match(html, /"screen":\{"width":1280,"height":720\}/);
+  assert.equal((await fetch(`${base}/`)).headers.get('x-frame-options'), 'SAMEORIGIN', 'admin UI cannot be framed');
+
+  const cover = await fetch(`${base}/api/games/emb/cover`);
+  assert.equal(cover.status, 200);
+  assert.deepEqual(Buffer.from(await cover.arrayBuffer()), png, 'encrypted title art is decrypted');
+
+  const auth = { Authorization: `Bearer ${TOKEN}` };
+  assert.equal((await fetch(`${base}/api/games/emb/cover`, { method: 'PUT', body: png })).status, 401);
+  const put = await fetch(`${base}/api/games/emb/cover`, { method: 'PUT', headers: { ...auth, 'Content-Type': 'image/webp' }, body: Buffer.from('RIFFxxxxWEBP') });
+  assert.equal(put.status, 200);
+  assert.equal((await put.json()).customCover, true);
+  const custom = await fetch(`${base}/api/games/emb/cover`);
+  assert.equal(custom.headers.get('content-type'), 'image/webp');
+});
+
+test('API-only mode hides the library but keeps games, embeds and the SDK', async () => {
+  const api = await startServer({ dataDir: lib.dataDir, port: 0, host: '127.0.0.1', adminToken: TOKEN, publicLibrary: true, apiOnly: true, maxUploadBytes: 1024 }, lib);
+  const b = `http://127.0.0.1:${api.address().port}`;
+  try {
+    assert.equal((await fetch(`${b}/`)).status, 404);
+    assert.equal((await fetch(`${b}/assets/app.js`)).status, 404);
+    assert.equal((await fetch(`${b}/api/games`)).status, 401);
+    assert.equal((await fetch(`${b}/api/games`, { headers: { Authorization: `Bearer ${TOKEN}` } })).status, 200);
+    assert.equal((await fetch(`${b}/play/served/r1/`)).status, 200);
+    assert.equal((await fetch(`${b}/embed/served/`)).status, 200);
+    const sdk = await fetch(`${b}/sdk/rpgm-embed.js`);
+    assert.equal(sdk.status, 200);
+    assert.equal(sdk.headers.get('access-control-allow-origin'), '*');
+    assert.match(await sdk.text(), /RPGMWeb/);
+    const info = await fetch(`${b}/api/games/served`);
+    assert.equal(info.headers.get('access-control-allow-origin'), '*');
+  } finally { api.close(); }
+});

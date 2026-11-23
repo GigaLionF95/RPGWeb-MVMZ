@@ -19,8 +19,13 @@ export function loadConfig(flags = {}) {
     port: Number(flags.port || process.env.RPGM_PORT || saved.port || 8080),
     host: flags.host || process.env.RPGM_HOST || saved.host || '0.0.0.0',
     adminToken: process.env.RPGM_ADMIN_TOKEN || saved.adminToken,
+    // API-only: no library page at /, the game list needs the admin token;
+    // games stay reachable at /play/<id>/ and /embed/<id>/.
+    apiOnly: /^api$/i.test(process.env.RPGM_MODE || saved.mode || '') || bool(process.env.RPGM_API_ONLY, saved.apiOnly ?? false),
     publicLibrary: bool(process.env.RPGM_PUBLIC_LIBRARY, saved.publicLibrary ?? true),
     maxUploadBytes: Number(process.env.RPGM_MAX_UPLOAD_GB || saved.maxUploadGB || 8) * 1024 ** 3,
+    // CSP frame-ancestors for embeds: '*' (anyone) or a space-separated list of origins
+    frameAncestors: process.env.RPGM_FRAME_ANCESTORS || saved.frameAncestors || '*',
     trustProxy: bool(process.env.RPGM_TRUST_PROXY, saved.trustProxy ?? false),
   };
 }

@@ -103,6 +103,29 @@ export class Library {
     if (hadOld) await fsp.rm(old, { recursive: true, force: true });
   }
 
+  // --- cover art (custom upload stored next to meta.json) -------------------
+  static COVER_TYPES = { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp' };
+
+  async customCover(id) {
+    for (const ext of Object.keys(Library.COVER_TYPES)) {
+      const p = path.join(this.gameDir(id), `cover.${ext}`);
+      try { await fsp.access(p); return { path: p, type: Library.COVER_TYPES[ext] }; } catch { /* next */ }
+    }
+    return null;
+  }
+
+  async setCover(id, buf, ext) {
+    if (!Library.COVER_TYPES[ext]) throw new Error('cover must be png, jpg or webp');
+    await this.removeCover(id);
+    await fsp.writeFile(path.join(this.gameDir(id), `cover.${ext}`), buf);
+    await this.updateMeta(id, { customCover: true, coverRev: Date.now() });
+  }
+
+  async removeCover(id, { updateMeta = false } = {}) {
+    for (const ext of Object.keys(Library.COVER_TYPES)) await fsp.rm(path.join(this.gameDir(id), `cover.${ext}`), { force: true });
+    if (updateMeta) await this.updateMeta(id, { customCover: false, coverRev: Date.now() });
+  }
+
   async remove(id) {
     if (!ID_RE.test(id)) throw new Error('bad id');
     this._cache.delete(id);

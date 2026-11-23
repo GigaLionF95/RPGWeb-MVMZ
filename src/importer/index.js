@@ -72,6 +72,20 @@ async function removeJunk(root) {
   await walk(root);
 }
 
+/** Re-run detection on an installed game (after upgrades of the analyzer). */
+export async function refreshGame(lib, id) {
+  const g = await lib.get(id);
+  if (!g) throw new Error(`no game "${id}"`);
+  const files = await listFiles(lib.rootDir(id));
+  const info = await analyzeGame(lib.rootDir(id), files);
+  const keep = ['id', 'title', 'packaging', 'source', 'importedAt', 'rev', 'transcode', 'hidden', 'coverRev', 'customCover'];
+  const meta = { ...info };
+  for (const k of keep) if (g.meta[k] !== undefined) meta[k] = g.meta[k];
+  await fsp.writeFile(path.join(lib.gameDir(id), 'files.json'), JSON.stringify(files));
+  await lib.writeMeta(id, meta);
+  return meta;
+}
+
 /**
  * @param {import('../library.js').Library} lib
  * @param {string} source  path to an archive or folder

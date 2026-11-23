@@ -63,8 +63,34 @@ export async function analyzeGame(root, files) {
     mp4: count(/^movies\/.*\.mp4$/i),
   };
 
-  const width = engine === 'mz' ? system?.advanced?.screenWidth || 816 : 816;
-  const height = engine === 'mz' ? system?.advanced?.screenHeight || 624 : 624;
+  let width = engine === 'mz' ? system?.advanced?.screenWidth || 816 : 816;
+  let height = engine === 'mz' ? system?.advanced?.screenHeight || 624 : 624;
+  // Resolution plugins (YEP_CoreEngine, Community_Basic, VisuMZ…) override it.
+  const pluginsPath = has('js/plugins.js');
+  if (pluginsPath) {
+    try {
+      const txt = await fsp.readFile(path.join(root, pluginsPath), 'utf8');
+      const list = JSON.parse(txt.slice(txt.indexOf('['), txt.lastIndexOf(']') + 1));
+      for (const p of list) {
+        if (!p?.status) continue;
+        for (const [k, v] of Object.entries(p.parameters || {})) {
+          const n = Number(String(v).trim());
+          if (!Number.isFinite(n) || n < 200 || n > 8192) continue;
+          if (/^screen ?width$/i.test(k)) width = n;
+          if (/^screen ?height$/i.test(k)) height = n;
+        }
+      }
+    } catch { /* unusual plugins.js; keep defaults */ }
+  }
+
+  // Title screen background → default cover art for embeds.
+  let titleArt = null;
+  if (system?.title1Name) {
+    for (const ext of ['.png', '.rpgmvp', '.png_']) {
+      const hit = has(`img/titles1/${system.title1Name}${ext}`);
+      if (hit) { titleArt = hit; break; }
+    }
+  }
 
   return {
     engine,
@@ -78,6 +104,7 @@ export async function analyzeGame(root, files) {
     mzGameId: engine === 'mz' ? system?.advanced?.gameId ?? null : null,
     screen: { width, height },
     icon: has('icon/icon.png') || null,
+    titleArt,
     media,
     fileCount: files.length,
     totalBytes: files.reduce((s, [, n]) => s + n, 0),

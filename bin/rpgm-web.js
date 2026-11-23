@@ -3,21 +3,25 @@
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { Library } from '../src/library.js';
-import { importGame } from '../src/importer/index.js';
+import fs from 'node:fs';
+import { importGame, refreshGame } from '../src/importer/index.js';
 import { loadConfig } from '../src/config.js';
 
 const HELP = `rpgm-web — run RPG Maker MV/MZ games in the browser
 
 Usage:
-  rpgm-web serve  [--port 8080] [--host 0.0.0.0] [--data ./data]
+  rpgm-web serve  [--port 8080] [--host 0.0.0.0] [--data ./data] [--api-only]
   rpgm-web import <archive-or-folder> [--id my-game] [--title "Title"] [--transcode auto|off|audio|video]
   rpgm-web list
   rpgm-web info   <id>
   rpgm-web remove <id>
+  rpgm-web refresh <id>|--all       re-detect resolution, cover art, media
+  rpgm-web cover  <id> <image.png|jpg|webp> | --remove
   rpgm-web token          print the admin API token
 
 Environment: RPGM_DATA, RPGM_PORT, RPGM_HOST, RPGM_ADMIN_TOKEN, RPGM_FFMPEG,
-             RPGM_PUBLIC_LIBRARY (1/0), RPGM_MAX_UPLOAD_GB
+             RPGM_PUBLIC_LIBRARY (1/0), RPGM_MAX_UPLOAD_GB, RPGM_MODE=api,
+             RPGM_FRAME_ANCESTORS
 `;
 
 const { values: opt, positionals } = parseArgs({
@@ -30,12 +34,16 @@ const { values: opt, positionals } = parseArgs({
     title: { type: 'string' },
     transcode: { type: 'string' },
     help: { type: 'boolean', short: 'h' },
+    all: { type: 'boolean' },
+    'api-only': { type: 'boolean' },
+    remove: { type: 'boolean' },
   },
 });
 
 const [cmd, ...args] = positionals;
 if (!cmd || opt.help) { process.stdout.write(HELP); process.exit(cmd ? 0 : 1); }
 
+if (opt['api-only']) process.env.RPGM_API_ONLY = '1';
 const config = loadConfig({ data: opt.data, port: opt.port, host: opt.host });
 const lib = new Library(config.dataDir);
 
@@ -85,6 +93,25 @@ try {
       if (!(await lib.get(args[0] || ''))) throw new Error(`no game "${args[0]}"`);
       await lib.remove(args[0]);
       console.log(`removed ${args[0]}`);
+      break;
+    }
+    case 'refresh': {
+      const ids = opt.all ? (await lib.list()).map((g) => g.id) : [args[0]];
+      if (!ids[0]) throw new Error('refresh: give an <id> or --all');
+      for (const id of ids) {
+        const m = await refreshGame(lib, id);
+        console.log(`refreshed ${id}: ${m.engine.toUpperCase()} ${m.screen.width}x${m.screen.height}${m.titleArt ? ', title art ' + m.titleArt : ''}`);
+      }
+      break;
+    }
+    case 'cover': {
+      const id = args[0];
+      if (!(await lib.get(id || ''))) throw new Error(`no game "${id}"`);
+      if (opt.remove) { await lib.removeCover(id, { updateMeta: true }); console.log('custom cover removed'); break; }
+      if (!args[1]) throw new Error('cover: missing <image> (or --remove)');
+      const ext = path.extname(args[1]).slice(1).toLowerCase().replace('jpeg', 'jpg');
+      await lib.setCover(id, fs.readFileSync(args[1]), ext);
+      console.log(`cover set for ${id}`);
       break;
     }
     case 'token':

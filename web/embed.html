@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex">
+<title>Play</title>
+<style>
+  :root {
+    --ink: #f3eef8;
+    --ink-2: #c9c0d4;
+    --ember: #f0a35e;
+    --ember-hi: #f7bc85;
+    --ember-ink: #2a1708;
+    --night: #0d0b12;
+    --btn: clamp(56px, 16vmin, 104px);
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; background: var(--night); color: var(--ink); overflow: hidden; }
+  body { font: 15px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+  ::selection { background: rgb(240 163 94 / .35); }
+
+  .stage { position: fixed; inset: 0; display: grid; place-items: center; isolation: isolate; cursor: pointer; }
+  .backdrop {
+    position: absolute; inset: -40px; z-index: -2;
+    background: var(--night) center / cover no-repeat;
+    filter: blur(28px) saturate(1.15) brightness(.55);
+    transform: scale(1.06);
+  }
+  .art {
+    position: absolute; inset: 0; z-index: -1; width: 100%; height: 100%;
+    object-fit: contain; opacity: 0; transition: opacity .5s cubic-bezier(.16, 1, .3, 1);
+  }
+  .art.ready { opacity: 1; }
+  .art.pixel { image-rendering: pixelated; }
+  .scrim {
+    position: absolute; inset: 0; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(ellipse 60% 55% at 50% 50%, rgb(13 11 18 / .05), rgb(13 11 18 / .45) 100%),
+      linear-gradient(to top, rgb(13 11 18 / .92) 0%, rgb(13 11 18 / .5) 28%, transparent 55%);
+  }
+  .icon-hero {
+    position: absolute; left: 50%; top: calc(50% - var(--btn) / 2 - 3vmin);
+    translate: -50% -100%;
+    width: clamp(48px, 16vmin, 140px); aspect-ratio: 1; border-radius: 22%;
+    image-rendering: pixelated; object-fit: cover;
+    box-shadow: 0 18px 40px -16px rgb(0 0 0 / .8);
+  }
+
+  .play {
+    position: absolute; left: 50%; top: 50%; translate: -50% -50%;
+    display: grid; place-items: center;
+    width: var(--btn); aspect-ratio: 1; border-radius: 50%;
+    border: 0; padding: 0; cursor: pointer;
+    background: var(--ember); color: var(--ember-ink);
+    box-shadow: 0 0 0 0 rgb(240 163 94 / .45), 0 14px 34px -10px rgb(0 0 0 / .75);
+    transition: transform .2s cubic-bezier(.16, 1, .3, 1), background-color .15s, box-shadow .4s;
+  }
+  .play svg { width: 44%; height: 44%; display: block; }
+  .stage:hover .play, .play:focus-visible { transform: scale(1.06); background: var(--ember-hi); box-shadow: 0 0 0 12px rgb(240 163 94 / .14), 0 14px 34px -10px rgb(0 0 0 / .75); }
+  .play:focus-visible { outline: 3px solid #fff; outline-offset: 4px; }
+  .play:active { transform: scale(.97); }
+  .play.loading svg { display: none; }
+  .play.loading::after {
+    content: ""; width: 36%; aspect-ratio: 1; border-radius: 50%;
+    border: 3px solid rgb(42 23 8 / .25); border-top-color: var(--ember-ink);
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { rotate: 1turn; } }
+
+  .caption {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    display: flex; align-items: flex-end; justify-content: space-between; gap: 16px;
+    padding: 0 max(18px, 3.5vmin) max(16px, 3vmin);
+    pointer-events: none;
+  }
+  .title { margin: 0; font-size: clamp(16px, 3.6vmin, 30px); font-weight: 700; letter-spacing: -.015em; line-height: 1.15; text-wrap: balance; text-shadow: 0 2px 12px rgb(0 0 0 / .6); }
+  .meta { margin: 4px 0 0; color: var(--ink-2); font-size: clamp(12px, 2vmin, 14px); font-variant-numeric: tabular-nums; text-shadow: 0 1px 8px rgb(0 0 0 / .7); }
+  .meta b { color: var(--ember); font-weight: 650; }
+  .open {
+    pointer-events: auto; flex: none; display: inline-flex; align-items: center; gap: 6px;
+    color: var(--ink-2); text-decoration: none; font-size: 13px; padding: 7px 10px; border-radius: 8px;
+    background: rgb(13 11 18 / .55); backdrop-filter: blur(6px);
+  }
+  .open:hover { color: var(--ink); background: rgb(13 11 18 / .8); }
+  .open:focus-visible { outline: 2px solid var(--ember); outline-offset: 2px; }
+  .open svg { width: 14px; height: 14px; }
+
+  .missing { position: fixed; inset: 0; display: grid; place-items: center; color: var(--ink-2); text-align: center; padding: 20px; }
+
+  @media (max-height: 260px) {
+    .meta { display: none; }
+    .open span { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation-duration: 2s !important; } }
+</style>
+</head>
+<body>
+<main class="stage" id="stage" hidden>
+  <div class="backdrop" id="backdrop"></div>
+  <img class="art" id="art" alt="">
+  <div class="scrim"></div>
+  <button class="play" id="play" type="button">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 5.5v13L19 12z" fill="currentColor"/></svg>
+  </button>
+  <div class="caption">
+    <div>
+      <h1 class="title" id="title"></h1>
+      <p class="meta" id="meta"></p>
+    </div>
+    <a class="open" id="open" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5M19 5l-8 8M17 14v4a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Open in new tab</span>
+    </a>
+  </div>
+</main>
+<p class="missing" id="missing" hidden>This game is not available.</p>
+<script>
+(function () {
+  var G = /*RPGM_EMBED*/null;
+  if (!G) { document.getElementById('missing').hidden = false; return; }
+  var $ = function (id) { return document.getElementById(id); };
+  document.title = G.title;
+  $('title').textContent = G.title;
+  var meta = $('meta');
+  var tag = document.createElement('b');
+  tag.textContent = 'RPG Maker ' + G.engine.toUpperCase();
+  meta.append(tag, ' · Click to play');
+  $('play').setAttribute('aria-label', 'Play ' + G.title);
+  $('open').href = G.open;
+
+  var art = $('art');
+  var img = G.cover || null;
+  if (img) {
+    $('backdrop').style.backgroundImage = 'url("' + img + '")';
+    art.onload = function () {
+      // Pixel art stays crisp; painted art scales smoothly.
+      if (art.naturalWidth * 1.5 <= innerWidth) art.classList.add('pixel');
+      art.classList.add('ready');
+    };
+    art.src = img;
+  } else if (G.icon) {
+    art.remove();
+    $('backdrop').style.backgroundImage = 'url("' + G.icon + '")';
+    var hero = document.createElement('img');
+    hero.className = 'icon-hero';
+    hero.alt = '';
+    hero.src = G.icon;
+    $('stage').insertBefore(hero, $('play'));
+  } else {
+    art.remove();
+  }
+  $('stage').hidden = false;
+
+  var started = false;
+  function start(e) {
+    if (e && e.target.closest && e.target.closest('#open')) return;
+    if (started) return;
+    started = true;
+    $('play').classList.add('loading');
+    $('play').setAttribute('aria-label', 'Loading ' + G.title);
+    // Pass through options the embedding site set on the iframe URL.
+    var q = new URLSearchParams(location.search), extra = '';
+    if (q.get('mute') === '1') extra += '&mute=1';
+    if (q.get('cloud') === '1') extra += '&cloud=1';
+    location.href = G.play + extra;
+  }
+  $('stage').addEventListener('click', start);
+  $('play').addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); start(); } });
+  // Back/forward cache: allow starting again after returning to this page.
+  addEventListener('pageshow', function () { started = false; $('play').classList.remove('loading'); });
+})();
+</script>
+</body>
+</html>
