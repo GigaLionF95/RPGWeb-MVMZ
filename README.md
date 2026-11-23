@@ -319,7 +319,7 @@ and run `docker compose up -d`. Use the primary's direct or private address when
 **Spreading players over the servers.** Pick one:
 
 - **Cloudflare, free:** add several proxied `A` records with the same name, one per server. Cloudflare spreads visitors between them. Use Cloudflare Load Balancing (paid) if you also want health checks and automatic failover.
-- **nginx in front** (this is how rpgm.gigahack.org runs: Cloudflare → nginx on one server → rpgm-web on two):
+- **nginx in front** (this is how rpgm.gigahack.org runs: Cloudflare → nginx on one server → rpgm-web on two, each with nginx sending its files, `RPGM_REPLICAS=all`):
 
   ```nginx
   upstream rpgm {
@@ -368,8 +368,9 @@ Memory stays flat whatever the archive size: everything is streamed.
 |---|---|---|---|---|
 | 1 | 1,750 | 365 MB/s | 131 ms | 1.5 cores |
 | 2 (auto) | 2,060 | 442 MB/s (≈ 3.5 Gbit/s) | 112 ms | 2 cores (all) |
+| 2 + [nginx sends the files](#nginx-sends-the-files) | 3,350 | 715 MB/s (≈ 6 Gbit/s) | 97 ms | 1.3 cores (Node 0.7, nginx 0.5) |
 
-No errors. Idle memory ~70 MB per process. Game files are big (≈ 210 KB per request on average), so the limit is copying bytes, not handling requests. Add cores, or nodes (see [Several servers](#several-servers)). With Cloudflare in front, most requests never reach the server at all.
+No errors. Idle memory ~70 MB per process. Game files are big (≈ 210 KB per request on average), so the limit is copying bytes, not handling requests. With nginx sending the files, the server still had spare CPU; the single load-generating process was the limit. Add cores, or nodes (see [Several servers](#several-servers)). With Cloudflare in front, most requests never reach the server at all.
 
 **What a player downloads** to reach the first screen (fresh browser, through Cloudflare):
 
