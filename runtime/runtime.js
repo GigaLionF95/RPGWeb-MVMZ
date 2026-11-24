@@ -141,28 +141,84 @@
 
   // Saves live in the host page's IndexedDB (same database and keys as
   // before the sandbox, so existing saves carry over).
+  // Until the saves have arrived, nothing is written: a game that started
+  // without them would overwrite the save list with only its new entries.
+  var hostLoaded = false;
   function hostLoad() {
     return new Promise(function (resolve) {
       var done = false;
       function onMsg(e) {
         var d = e.data;
         if (e.source !== window.parent || e.origin !== HERE || !d || d.rpgm !== 1 || d.type !== 'kv-data') return;
-        done = true;
         removeEventListener('message', onMsg);
         if (!d.ok) { persistentOk = false; console.warn('[rpgm-web] browser storage unavailable, saves will not persist:', d.error); }
-        (d.entries || []).forEach(function (kv) { mem.set(kv[0], kv[1]); });
+        // Late answer: keep what the game wrote since, take the rest.
+        (d.entries || []).forEach(function (kv) { if (!done || !dirty.has(kv[0])) mem.set(kv[0], kv[1]); });
+        hostLoaded = true;
+        if (done) { console.warn('[rpgm-web] saves arrived late, reloading the save list'); refreshSaveList(); schedule(); }
+        done = true;
         resolve();
       }
       addEventListener('message', onMsg);
       postParent({ type: 'kv-load' });
       setTimeout(function () {
         if (done) return;
-        removeEventListener('message', onMsg);
-        persistentOk = false;
-        console.warn('[rpgm-web] no answer from the host page, saves will not persist');
+        done = true;
+        console.warn('[rpgm-web] the host page has not sent the saves yet; starting without them, nothing is saved until they arrive');
         resolve();
       }, 10000);
     });
+  }
+  // Another tab of this game wrote something: take it, so this tab's save list
+  // stays current and its next save does not drop the other tab's saves.
+  addEventListener('message', function (e) {
+    var d = e.data;
+    if (e.source !== window.parent || e.origin !== HERE || !d || d.rpgm !== 1 || d.type !== 'kv-sync' || !Array.isArray(d.ops)) return;
+    d.ops.forEach(function (op) {
+      if (!Array.isArray(op) || typeof op[0] !== 'string' || dirty.has(op[0])) return;
+      if (op.length < 2) mem.delete(op[0]); else mem.set(op[0], op[1]);
+    });
+    refreshSaveList();
+  });
+  /** MZ: list save files that exist but are missing from the save list, read each, add its entry. */
+  function recoverSaveList() {
+    var DM = DataManager, info = DM._globalInfo, missing = [], found = 0;
+    var max = DM.maxSavefiles ? DM.maxSavefiles() : 20;
+    for (var id = 0; id < max; id++) if (!info[id] && DM.savefileExists(id)) missing.push(id);
+    if (!missing.length) return Promise.resolve();
+    return missing.reduce(function (p, id) {
+      return p.then(function () {
+        return StorageManager.loadObject(DM.makeSavename(id)).then(function (contents) {
+          DM.createGameObjects();
+          DM.extractSaveContents(contents);
+          // Plugins describe a save with its map too (name, location).
+          var mapId = $gameMap && $gameMap.mapId();
+          if (!(mapId > 0) || !DM.loadMapData) return;
+          DM.loadMapData(mapId);
+          return new Promise(function (resolve) {
+            var t0 = Date.now();
+            (function wait() { if (DM.isMapLoaded() || Date.now() - t0 > 8000) resolve(); else setTimeout(wait, 50); })();
+          });
+        }).then(function () {
+          info[id] = DM.makeSavefileInfo();
+          found++;
+        }).catch(function (e) { console.warn('[rpgm-web] save file ' + id + ' could not be read:', e); });
+      });
+    }, Promise.resolve()).then(function () {
+      DM.createGameObjects();
+      if (found) {
+        DM.saveGlobalInfo();
+        console.warn('[rpgm-web] put ' + found + ' save file(s) that were missing from the save list back on it');
+      }
+    });
+  }
+  /** Make the engine re-read its cached list of save files. */
+  function refreshSaveList() {
+    try {
+      if (typeof DataManager === 'undefined' || !DataManager._globalInfo) return;
+      if (CFG.engine === 'mz') DataManager.loadGlobalInfo();
+      else DataManager._globalInfo = null;
+    } catch (e) { /* the engine reads it again when it needs it */ }
   }
 
   // Cloud saves: when the embedding site opted in (iframe URL has cloud=1),
@@ -215,7 +271,7 @@
       cloud.timer = setTimeout(cloudPush, 150);
       return;
     }
-    if (!dirty.size) return;
+    if (!dirty.size || !hostLoaded) return;
     var ops = [];
     dirty.forEach(function (v, k) { ops.push(v === DELETE ? [k] : [k, v]); });
     dirty = new Map();
@@ -1222,8 +1278,36 @@
       if (typeof SceneManager !== 'undefined') {
         var term = SceneManager.terminate;
         SceneManager.terminate = function () { try { term && term.apply(this, arguments); } finally { backToLibrary(); } };
+        // Firefox now and then hands the frame a mouse event it may not read;
+        // reading clientX in a listener (PIXI's, a plugin's) then throws. That
+        // event is simply lost: not a reason to stop the game.
+        var onError = SceneManager.onError;
+        if (onError) {
+          SceneManager.onError = function (ev) {
+            var msg = String((ev && (ev.message || (ev.error && ev.error.message))) || '');
+            if (/^(Error: |SecurityError: )?Permission denied to access property /.test(msg)) { console.warn('[rpgm-web] ignored: ' + msg); return; }
+            return onError.apply(this, arguments);
+          };
+        }
       }
       startGpuGuard();
+      if (CFG.engine === 'mz' && typeof DataManager !== 'undefined' && DataManager.isGlobalInfoLoaded) {
+        // Before the title screen, put save files the save list lost (an older
+        // tab overwrote it) back on it.
+        var recovery = 0; // 0 not started, 1 running, 2 done
+        var isLoaded = DataManager.isGlobalInfoLoaded;
+        var recovered = function () { recovery = 2; };
+        DataManager.isGlobalInfoLoaded = function () {
+          var ok = isLoaded.apply(this, arguments);
+          if (!ok || recovery === 2) return ok;
+          if (recovery === 0) {
+            if (!DataManager.isDatabaseLoaded()) return ok;
+            recovery = 1;
+            try { recoverSaveList().then(recovered, recovered); } catch (e) { recovered(); }
+          }
+          return false;
+        };
+      }
     },
     objects: function () {
       if (CFG.engine === 'mv' && typeof Game_Interpreter !== 'undefined') {
@@ -1560,7 +1644,9 @@
     });
     var hideTimer = null;
     var reveal = function () { btn.classList.add('show'); clearTimeout(hideTimer); hideTimer = setTimeout(function () { if (menu.hidden) btn.classList.remove('show'); }, 2500); };
-    origAdd.call(window, 'mousemove', function (e) { if (e.clientX < 120 && e.clientY < 120) reveal(); }, { passive: true });
+    // Firefox can hand this frame a mouse event it may not read ("Permission
+    // denied to access property clientX"); an error here would stop the game.
+    origAdd.call(window, 'mousemove', function (e) { try { if (e.clientX < 120 && e.clientY < 120) reveal(); } catch (err) { /* not ours to read */ } }, { passive: true });
     if (matchMedia('(pointer: coarse)').matches) btn.classList.add('touch');
     var stop = function (e) { e.stopPropagation(); };
     ['mousedown', 'mouseup', 'touchstart', 'touchend', 'pointerdown', 'pointerup', 'click', 'wheel'].forEach(function (t) { host.addEventListener(t, stop); });

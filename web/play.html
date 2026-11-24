@@ -68,7 +68,13 @@
       });
     });
   }
+  // Other tabs with the same game: tell their games what this one wrote, so
+  // no tab keeps a stale save list and overwrites the others' saves with it.
+  var peers = null;
+  try { peers = new BroadcastChannel('rpgm-web-kv:' + G.id); } catch (e) { /* old browser */ }
+  if (peers) peers.onmessage = function (e) { if (e.data && Array.isArray(e.data.ops)) toGame({ type: 'kv-sync', ops: e.data.ops }); };
   function write(ops) {
+    try { peers && peers.postMessage({ ops: ops }); } catch (e) { /* not cloneable: other tabs reload it */ }
     // Transactions are created in message order, so writes land in order.
     dbp.then(function (db) {
       var tx = db.transaction('kv', 'readwrite');
