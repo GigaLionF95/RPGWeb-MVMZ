@@ -1191,7 +1191,8 @@
       // Browser mode with desktop-like presentation.
       Utils.isNwjs = function () { return false; };
       if (typeof Graphics !== 'undefined') Graphics._defaultStretchMode = function () { return true; };
-      try { patchPixiUploads(); } catch (e) { /* unknown PIXI build: leave it */ }
+      // Experiment only: in Firefox on macOS this made window contents glitch every frame.
+      if (params.get('rpgm-orphan') === '1') { try { patchPixiUploads(); } catch (e) { /* unknown PIXI build */ } }
       if (typeof WebAudio !== 'undefined' && WebAudio.setMasterVolume) {
         var setMaster = WebAudio.setMasterVolume;
         WebAudio.setMasterVolume = function (v) { userMasterVolume = v; return setMaster.call(this, muted ? 0 : v); };
