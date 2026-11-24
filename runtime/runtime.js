@@ -48,6 +48,48 @@
     };
     corsify(window.HTMLImageElement && HTMLImageElement.prototype, 'src');
     corsify(window.HTMLMediaElement && HTMLMediaElement.prototype, 'src');
+    // - requests "with credentials" (cookies) to the server: browsers refuse the
+    //   server's "Access-Control-Allow-Origin: *" for those, so the load fails.
+    //   Game files need no cookies; send them without. (Old Effekseer, in MZ
+    //   1.1 games, hard-codes image.crossOrigin = "use-credentials".)
+    var ours = function (u) { try { return new URL(String(u), location.href).origin === HERE; } catch (e) { return false; } };
+    var co = window.HTMLImageElement && Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'crossOrigin');
+    var srcD = window.HTMLImageElement && Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    if (co && co.set && srcD && srcD.set) {
+      Object.defineProperty(HTMLImageElement.prototype, 'crossOrigin', {
+        configurable: true, enumerable: co.enumerable, get: co.get,
+        set: function (v) {
+          // Before src is known, keep the wish; the src setter below decides.
+          if (v === 'use-credentials') { this.__rpgmCreds = true; v = 'anonymous'; }
+          co.set.call(this, v);
+        },
+      });
+      var srcWrapped = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+      Object.defineProperty(HTMLImageElement.prototype, 'src', {
+        configurable: true, enumerable: srcWrapped.enumerable, get: srcWrapped.get,
+        set: function (v) {
+          // A credentialed load of another site's image keeps its credentials.
+          if (this.__rpgmCreds && !ours(v)) co.set.call(this, 'use-credentials');
+          srcWrapped.set.call(this, v);
+        },
+      });
+    }
+    if (window.XMLHttpRequest) {
+      var XO2 = XMLHttpRequest.prototype.open, XS2 = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (m, u) { this.__rpgmOurs = ours(u); return XO2.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function () {
+        if (this.__rpgmOurs && this.withCredentials) this.withCredentials = false;
+        return XS2.apply(this, arguments);
+      };
+    }
+    if (window.fetch) {
+      var F2 = window.fetch;
+      window.fetch = function (input, init) {
+        var url = input && input.url ? input.url : input;
+        if (init && init.credentials === 'include' && ours(url)) init = Object.assign({}, init, { credentials: 'omit' });
+        return F2.call(this, input, init);
+      };
+    }
     // - scripts too, so errors in them show their message instead of
     //   "Script error." (plugins are added as <script src> by the engine);
     corsify(window.HTMLScriptElement && HTMLScriptElement.prototype, 'src');
