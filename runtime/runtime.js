@@ -1086,6 +1086,75 @@
   try { muted = params.get('mute') === '1' || window.sessionStorage.getItem('rpgm-muted') === '1'; } catch (e) { /* ignore */ }
   var userMasterVolume = 1;
 
+  // GPU buffer guard (MZ, WebGL2). Some GPU drivers (seen in Firefox on macOS)
+  // now and then end up with a wrong value in one of PIXI's small static vertex
+  // buffers, or a vertex-array object pointing at the wrong buffer. The quad
+  // every tiling sprite shares (map parallaxes, window backgrounds) then draws
+  // half of the screen sheared until the page is reloaded. Every few seconds,
+  // outside rendering, compare the small buffers PIXI believes are up to date
+  // with what the GPU holds, and rebuild whatever differs.
+  function gpuCheck() {
+    var r = typeof Graphics !== 'undefined' && Graphics.app && Graphics.app.renderer;
+    var gl = r && r.gl, gs = r && r.geometry;
+    if (!gl || !gs || !gs.managedGeometries || typeof WebGL2RenderingContext === 'undefined' || !(gl instanceof WebGL2RenderingContext)) return;
+    if (gl.isContextLost()) return;
+    var U = r.CONTEXT_UID, fixed = [];
+    var prevVao = gl.getParameter(gl.VERTEX_ARRAY_BINDING), prevCopy = gl.getParameter(gl.COPY_READ_BUFFER_BINDING);
+    try {
+      Object.keys(gs.managedGeometries).forEach(function (id) {
+        var g = gs.managedGeometries[id], bad = false;
+        // Small static geometry only (quads); batches and tilemaps rewrite theirs every frame.
+        if (!g.buffers.every(function (b) { return b.static && (!b.data || b.data.byteLength <= 1024); })) return;
+        var glBufs = g.buffers.map(function (b) { return b._glBuffers && b._glBuffers[U]; });
+        g.buffers.forEach(function (b, i) {
+          var gb = glBufs[i], data = b.data;
+          if (!gb || !gb.buffer || !data || !data.byteLength || gb.updateID !== b._updateID) return;
+          var got = new data.constructor(data.length);
+          gl.bindBuffer(gl.COPY_READ_BUFFER, gb.buffer);
+          gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, got);
+          for (var k = 0; k < data.length; k++) {
+            if (got[k] !== data[k] && !(got[k] !== got[k] && data[k] !== data[k])) { b._updateID++; fixed.push(g.constructor.name + ' buffer ' + i + '[' + k + '] ' + got[k] + '≠' + data[k]); return; }
+          }
+        });
+        var vaos = g.glVertexArrayObjects && g.glVertexArrayObjects[U];
+        if (vaos) {
+          var want = glBufs.map(function (b) { return b && b.buffer; });
+          var ib = g.indexBuffer && g.indexBuffer._glBuffers && g.indexBuffer._glBuffers[U];
+          Object.keys(vaos).forEach(function (sig) {
+            if (bad) return;
+            gl.bindVertexArray(vaos[sig]);
+            if (ib && gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING) !== ib.buffer) bad = 'index buffer';
+            for (var a = 0; a < 16 && !bad; a++) {
+              if (gl.getVertexAttrib(a, gl.VERTEX_ATTRIB_ARRAY_ENABLED) && want.indexOf(gl.getVertexAttrib(a, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING)) < 0) bad = 'attribute ' + a;
+            }
+          });
+          if (bad) {
+            gl.bindVertexArray(null);
+            Object.keys(vaos).forEach(function (sig) {
+              if (sig[0] !== 'g') return; // the rest are aliases of these
+              gl.deleteVertexArray(vaos[sig]);
+              glBufs.forEach(function (b) { if (b && b.refCount > 1) b.refCount--; }); // recreated on next draw
+            });
+            g.glVertexArrayObjects[U] = {};
+            fixed.push(g.constructor.name + ' vertex array: ' + bad);
+          }
+        }
+      });
+    } catch (e) { /* diagnostics only */ }
+    gl.bindBuffer(gl.COPY_READ_BUFFER, prevCopy);
+    var vaoGone = fixed.some(function (f) { return / vertex array: /.test(f); });
+    if (vaoGone) { gs.reset(); } else gl.bindVertexArray(prevVao);
+    if (fixed.length) {
+      R.gpuRepairs = (R.gpuRepairs || []).concat(fixed).slice(-20);
+      console.warn('[rpgm-web] repaired GPU state: ' + fixed.join('; '));
+    }
+  }
+  function startGpuGuard() {
+    if (R.gpuGuard) return;
+    R.gpuGuard = setInterval(gpuCheck, 2000);
+    R.gpuCheck = gpuCheck;
+  }
+
   function canPlay(el, type) { try { return !!el.canPlayType(type).replace(/no/, ''); } catch (e) { return false; } }
 
   var HOOKS = {
@@ -1124,6 +1193,7 @@
         var term = SceneManager.terminate;
         SceneManager.terminate = function () { try { term && term.apply(this, arguments); } finally { backToLibrary(); } };
       }
+      startGpuGuard();
     },
     objects: function () {
       if (CFG.engine === 'mv' && typeof Game_Interpreter !== 'undefined') {
