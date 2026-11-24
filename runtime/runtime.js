@@ -1086,13 +1086,12 @@
   try { muted = params.get('mute') === '1' || window.sessionStorage.getItem('rpgm-muted') === '1'; } catch (e) { /* ignore */ }
   var userMasterVolume = 1;
 
-  // GPU buffer guard (MZ, WebGL2). Some GPU drivers (seen in Firefox on macOS)
-  // now and then end up with a wrong value in one of PIXI's small static vertex
-  // buffers, or a vertex-array object pointing at the wrong buffer. The quad
-  // every tiling sprite shares (map parallaxes, window backgrounds) then draws
-  // half of the screen sheared until the page is reloaded. Every few seconds,
-  // outside rendering, compare the small buffers PIXI believes are up to date
-  // with what the GPU holds, and rebuild whatever differs.
+  // GPU state guard (MZ, WebGL2), a backstop for patchPixiUploads below.
+  // Firefox on macOS was seen drawing half of the map background sheared for a
+  // whole session: one vertex of the quad every tiling sprite shares (map
+  // parallaxes, window backgrounds) came out wrong. Every few seconds, outside
+  // rendering, compare PIXI's small static buffers and vertex arrays with what
+  // the GPU holds, and rebuild whatever differs.
   function gpuCheck() {
     var r = typeof Graphics !== 'undefined' && Graphics.app && Graphics.app.renderer;
     var gl = r && r.gl, gs = r && r.geometry;
@@ -1149,6 +1148,35 @@
       console.warn('[rpgm-web] repaired GPU state: ' + fixed.join('; '));
     }
   }
+  // PIXI rewrites the one quad all tiling sprites share with bufferSubData
+  // several times a frame, while earlier draws may still read it. A driver that
+  // gets this race wrong keeps getting it wrong the same way every frame, so
+  // small buffers are re-specified with bufferData instead: the driver gives
+  // each upload fresh storage and nothing in flight is overwritten.
+  function patchPixiUploads() {
+    var GS = typeof PIXI !== 'undefined' && PIXI.systems && PIXI.systems.GeometrySystem;
+    var orig = GS && GS.prototype.updateBuffers;
+    if (!orig || orig.__rpgm || !/bufferSubData\(type, 0, buffer\.data\)/.test(String(orig))) return;
+    GS.prototype.updateBuffers = function () {
+      var geometry = this._activeGeometry, gl = this.gl;
+      for (var i = 0; i < geometry.buffers.length; i++) {
+        var buffer = geometry.buffers[i], glBuffer = buffer._glBuffers[this.CONTEXT_UID];
+        if (buffer._updateID === glBuffer.updateID) continue;
+        glBuffer.updateID = buffer._updateID;
+        var type = buffer.index ? gl.ELEMENT_ARRAY_BUFFER : gl.ARRAY_BUFFER;
+        gl.bindBuffer(type, glBuffer.buffer);
+        this._boundBuffer = glBuffer;
+        if (glBuffer.byteLength >= buffer.data.byteLength && buffer.data.byteLength > 16384) {
+          gl.bufferSubData(type, 0, buffer.data);
+        } else {
+          glBuffer.byteLength = buffer.data.byteLength;
+          gl.bufferData(type, buffer.data, buffer.static ? gl.STATIC_DRAW : gl.DYNAMIC_DRAW);
+        }
+      }
+    };
+    GS.prototype.updateBuffers.__rpgm = true;
+  }
+
   function startGpuGuard() {
     if (R.gpuGuard) return;
     R.gpuGuard = setInterval(gpuCheck, 2000);
@@ -1163,6 +1191,7 @@
       // Browser mode with desktop-like presentation.
       Utils.isNwjs = function () { return false; };
       if (typeof Graphics !== 'undefined') Graphics._defaultStretchMode = function () { return true; };
+      try { patchPixiUploads(); } catch (e) { /* unknown PIXI build: leave it */ }
       if (typeof WebAudio !== 'undefined' && WebAudio.setMasterVolume) {
         var setMaster = WebAudio.setMasterVolume;
         WebAudio.setMasterVolume = function (v) { userMasterVolume = v; return setMaster.call(this, muted ? 0 : v); };
