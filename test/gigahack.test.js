@@ -28,6 +28,11 @@ test('GigaHack: off by default, an admin switches it on per game, modules append
   try {
     const base = `http://127.0.0.1:${s.address().port}`;
     const game = `${base}/play/gh/r1/`;
+    // The library page (where the switch lives) asks for its script by content version.
+    const page = await (await fetch(`${base}/`)).text();
+    assert.match(page, /src="assets\/app\.js\?v=[0-9a-f]{10}"/);
+    assert.match(page, /href="assets\/style\.css\?v=[0-9a-f]{10}"/);
+    assert.match(page, /data-act="gigahack"/);
     let info = await (await fetch(`${base}/api/games/gh`)).json();
     assert.equal(info.gigahack, false);
     assert.equal(info.gigahackAvailable, true);

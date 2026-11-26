@@ -267,6 +267,12 @@ export async function startServer(config, lib) {
     .update(fs.readFileSync(path.join(WEB_DIR, 'play.html')))
     .digest('hex').slice(0, 10);
 
+  // Version of the library page's script and stylesheet (their URLs carry it).
+  const assetsVersion = crypto.createHash('sha1')
+    .update(fs.readFileSync(path.join(WEB_DIR, 'app.js')))
+    .update(fs.readFileSync(path.join(WEB_DIR, 'style.css')))
+    .digest('hex').slice(0, 10);
+
   const isAdmin = (req) => {
     const h = String(req.headers.authorization || '');
     const tok = h.startsWith('Bearer ') ? h.slice(7) : '';
@@ -899,7 +905,12 @@ export async function startServer(config, lib) {
       }
       if (p === '/' || p === '/index.html') {
         setFrameHeaders(res, false);
-        return await sendFile(req, res, path.join(WEB_DIR, 'index.html'), { cacheControl: 'no-cache' });
+        // Assets by content version: a CDN may turn their no-cache into a day of
+        // browser caching, and a new page with yesterday's script misses features.
+        return await sendFile(req, res, path.join(WEB_DIR, 'index.html'), {
+          cacheControl: 'no-cache', etagSeed: `${assetsVersion}-`, cacheKey: `library|${assetsVersion}`,
+          transform: (buf) => Buffer.from(buf.toString('utf8').replace(/(["'])assets\/([\w.-]+\.(?:js|css))\1/g, (m, q, f) => `${q}assets/${f}?v=${assetsVersion}${q}`)),
+        });
       }
       const asset = /^\/assets\/([\w.-]+)$/.exec(p);
       if (asset) return await sendFile(req, res, path.join(WEB_DIR, asset[1]), { cacheControl: 'no-cache' });
