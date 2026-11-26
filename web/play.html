@@ -100,7 +100,18 @@
   var RELAY_UP = { hello: 1, save: 1, started: 1, exit: 1 };
   var RELAY_DOWN = { saves: 1, saved: 1 };
 
+  // Ask before a reload or a closed tab throws away progress made since the
+  // last save. The game itself leaving (Exit, back to the library) does not ask.
+  // Browsers show their own wording, and only after the player has interacted.
+  var leaving = false;
+  addEventListener('beforeunload', function (e) {
+    if (leaving) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
+
   function navigate(to) {
+    leaving = true;
     if (to === 'embed') {
       var q = new URLSearchParams(location.search), keep = new URLSearchParams();
       ['mute', 'cloud'].forEach(function (k) { if (q.get(k)) keep.set(k, q.get(k)); });
