@@ -10,6 +10,7 @@ COPY bin ./bin
 COPY src ./src
 COPY runtime ./runtime
 COPY web ./web
+COPY vendor ./vendor
 
 ENV RPGM_DATA=/data \
     RPGM_PORT=8080 \

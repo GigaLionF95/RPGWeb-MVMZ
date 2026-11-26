@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
 import { mimeOf, isCompressible } from './mime.js';
 import { hookFor, patchScript, patchIndexHtml } from './inject.js';
+import { gigahack, gigahackFile, gigahackPluginsPatch } from '../gigahack.js';
 import { importGame } from '../importer/index.js';
 import { ID_RE } from '../library.js';
 import { decrypt, ENCRYPTED_EXT } from '../importer/rpgcrypt.js';
@@ -422,6 +423,12 @@ export async function startServer(config, lib) {
     try { rel = rel.split('/').map(decodeURIComponent).join('/'); } catch { throw new HttpError(400, 'bad path'); }
     if (rel.split('/').some((s) => s === '..' || s === '.')) throw new HttpError(400, 'bad path');
     const hit = resolveGamePath(g, rel);
+    const gh = gigahackOn(meta) ? gigahack() : null;
+    if (!hit && gh) {
+      // GigaHack modules the game does not ship itself: from the vendored copy.
+      const f = gigahackFile(rel);
+      if (f) return sendFile(req, res, f, { type: 'text/javascript; charset=utf-8', cacheControl: 'no-cache', etagSeed: `gh${gh.version}-` });
+    }
     if (!hit) {
       // A plugin asked for an encrypted asset by its plain name (texture.png
       // when only texture.png_ exists), e.g. as the fallback after its own
@@ -438,6 +445,16 @@ export async function startServer(config, lib) {
     }
     if (!g.local) return forwardGame(req, res, id, new URL(req.url, 'http://x'));
     const hook = hookFor(hit);
+    if (hook === 'plugins' && gh) {
+      // GigaHack's entries before the runtime hook call (a different file than the precompressed copy).
+      const ghPatch = gigahackPluginsPatch();
+      return sendFile(req, res, path.join(lib.rootDir(id), hit), {
+        cacheControl: 'no-cache',
+        transform: (buf) => patchScript(Buffer.concat([buf, Buffer.from(ghPatch)]), hook),
+        cacheKey: `hook|${id}|${hit}|${runtimeVersion}|gh${gh.version}`,
+        etagSeed: `${runtimeVersion}-gh${gh.version}-`,
+      });
+    }
     const preFiles = await preIndex(id, g);
     if (!hook && useAccel(req) && await accelFile(req, res, id, hit, preFiles, immutable)) return;
     return sendFile(req, res, path.join(lib.rootDir(id), hit), {
@@ -468,8 +485,13 @@ export async function startServer(config, lib) {
       coverUrl: hasCover ? `api/games/${m.id}/cover?v=${m.coverRev || m.rev}` : null,
       preloadDefault: config.preload === 'live2d',
       preloadOn: preloadOn(m),
+      gigahack: gigahackOn(m),
+      gigahackAvailable: !!gigahack(),
     };
   }
+
+  /** GigaHack mod menu: on for this game (admin setting) and the vendored copy is there. */
+  const gigahackOn = (m) => m.gigahack === true && !!gigahack();
 
   /** Live2D preload for this game: its own setting, else the server's. */
   const preloadOn = (m) => !!m.live2d && (typeof m.preload === 'boolean' ? m.preload : config.preload === 'live2d');
@@ -754,6 +776,7 @@ export async function startServer(config, lib) {
           if (typeof body.title === 'string' && body.title.trim()) patch.title = body.title.trim().slice(0, 200);
           if (typeof body.hidden === 'boolean') patch.hidden = body.hidden;
           if (typeof body.preload === 'boolean' || body.preload === null) patch.preload = body.preload;
+          if (typeof body.gigahack === 'boolean') patch.gigahack = body.gigahack;
           return sendJson(res, 200, publicMeta(await lib.updateMeta(id, patch)));
         }
         if (method === 'DELETE') { requireAdmin(req); await lib.remove(id); return sendJson(res, 200, { removed: id }); }

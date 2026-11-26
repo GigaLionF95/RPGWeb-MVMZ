@@ -163,6 +163,15 @@ Fixed size:
 - Saves in a plain embed stay in the visitor's browser and are partitioned by the embedding site (browser privacy rules), so they are not shared with the same game opened directly on your server. Use cloud saves to make them follow the player.
 - Restrict which sites may embed your games with `RPGM_FRAME_ANCESTORS="https://blog.example.com https://*.example.org"`. The library/admin page itself can never be framed.
 
+## GigaHack mod menu
+
+[GigaHack MV/MZ](https://github.com/GigaLionF95/GigaHack-MVMZ) is a mod, cheat and debug menu for RPG Maker MV and MZ games, from the same author. A copy ships in `vendor/gigahack/`. Switch it on per game with the wrench button on the game's card in the library (as admin), or `PATCH /api/games/<id>` with `{"gigahack": true}`.
+
+- Nothing in the game folder changes: the server appends GigaHack's modules to the end of `js/plugins.js` as it sends it and serves `js/plugins/GigaHack_*.js` from `vendor/gigahack/`. Turning it off takes effect the next time a player starts the game.
+- A game that ships its own GigaHack keeps its own copy and its own on/off entries.
+- Players open the menu with **N** (GigaHack picks another key if the game already uses N; Settings shows it). In the browser, GigaHack's file-based features (save backups, export/import, image folder pickers) are unavailable and say so; its settings stay in the player's browser.
+- To update the copy: replace `vendor/gigahack/` with `gigahack/js/plugins/`, `gigahack/manifest.json`, `LICENSE` and `NOTICE.md` from a newer GigaHack checkout, and put its commit in `vendor/gigahack/COMMIT`.
+
 ## Cloud saves (for site owners)
 
 Keep saves on your own backend, under your own accounts. Load the SDK from your rpgm-web server and tell it how to read and write saves for the signed-in player:
@@ -243,7 +252,7 @@ Write requests need `Authorization: Bearer <token>`.
 | `POST` | `/api/uploads/<upload>/finish[?id=…][&title=…]` | all bytes are in: starts the import, `202 {job}`. Unfinished uploads are deleted after a day |
 | `GET` | `/api/jobs/<job>` | import status: phase, progress, log |
 | `GET` | `/api/games/<id>` | game info, including `url`, `embedUrl`, `coverUrl`, `screen` |
-| `PATCH` | `/api/games/<id>` | `{"title": "…", "hidden": true, "preload": false}`. `preload`: Live2D preload for this game, `true`/`false`, or `null` for the server default (`RPGM_PRELOAD`). `hidden` means *unlisted*: the game leaves the public list, but `/play/<id>/`, `/embed/<id>/` and `GET /api/games/<id>` keep working for anyone with the link |
+| `PATCH` | `/api/games/<id>` | `{"title": "…", "hidden": true, "preload": false, "gigahack": true}`. `gigahack`: the GigaHack mod menu for this game, see below. `preload`: Live2D preload for this game, `true`/`false`, or `null` for the server default (`RPGM_PRELOAD`). `hidden` means *unlisted*: the game leaves the public list, but `/play/<id>/`, `/embed/<id>/` and `GET /api/games/<id>` keep working for anyone with the link |
 | `DELETE` | `/api/games/<id>` | remove the game |
 | `GET` / `PUT` / `DELETE` | `/api/games/<id>/cover` | cover image (PUT body: PNG/JPEG/WebP, ≤ 10 MB) |
 | `GET` | `/play/<id>/` | play |

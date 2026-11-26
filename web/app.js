@@ -115,6 +115,13 @@ function renderGames(games) {
     tag.className = 'tag';
     tag.textContent = `${g.engine.toUpperCase()}${g.engineVersion ? ' ' + g.engineVersion : ''}`;
     meta.append(tag, ` · ${fmtBytes(g.totalBytes)} · ${num.format(g.fileCount)} files${g.hidden ? ' · unlisted' : ''}`);
+    if (g.gigahack) {
+      const gh = document.createElement('span');
+      gh.className = 'tag';
+      gh.textContent = 'GigaHack';
+      gh.title = 'Comes with the GigaHack mod menu';
+      meta.append(' · ', gh);
+    }
     const play = li.querySelector('.play');
     play.href = g.url;
     play.setAttribute('aria-label', `Play ${g.title}`);
@@ -125,6 +132,12 @@ function renderGames(games) {
     hideBtn.title = g.hidden ? 'Show in the library' : 'Unlist: hide from the library, the link keeps working';
     hideBtn.setAttribute('aria-label', hideBtn.title);
     hideBtn.querySelector('use').setAttribute('href', g.hidden ? '#i-eye-off' : '#i-eye');
+    const ghBtn = li.querySelector('[data-act=gigahack]');
+    ghBtn.hidden = !g.gigahackAvailable;
+    ghBtn.classList.toggle('on', !!g.gigahack);
+    ghBtn.setAttribute('aria-pressed', String(!!g.gigahack));
+    ghBtn.title = g.gigahack ? 'GigaHack mod menu is on: click to turn it off' : 'Turn on the GigaHack mod menu for this game';
+    ghBtn.setAttribute('aria-label', ghBtn.title);
     list.append(li);
   }
 }
@@ -326,6 +339,11 @@ $('#games').addEventListener('click', async (e) => {
       const hidden = !li.classList.contains('hidden-game');
       applyGame(id, await api(`games/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hidden }) }));
       await refresh();
+    } else if (act === 'gigahack') {
+      const on = !(byId.get(id) || {}).gigahack;
+      applyGame(id, await api(`games/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gigahack: on }) }));
+      await refresh();
+      setStatus(on ? 'GigaHack is on for this game: players get it the next time they start it (key N opens the menu).' : 'GigaHack is off for this game.');
     } else if (act === 'rename') startRename(li, id);
   } catch (err) { setStatus(err.message); }
 });

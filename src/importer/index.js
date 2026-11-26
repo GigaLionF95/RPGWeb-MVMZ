@@ -151,7 +151,7 @@ export async function refreshGame(lib, id, opts = {}) {
   }
   const files = await listFiles(lib.rootDir(id));
   const info = await analyzeGame(lib.rootDir(id), files);
-  const keep = ['id', 'title', 'packaging', 'source', 'importedAt', 'rev', 'transcode', 'hidden', 'coverRev', 'customCover', 'images', 'preload'];
+  const keep = ['id', 'title', 'packaging', 'source', 'importedAt', 'rev', 'transcode', 'hidden', 'coverRev', 'customCover', 'images', 'preload', 'gigahack'];
   const meta = { ...info };
   for (const k of keep) if (g.meta[k] !== undefined) meta[k] = g.meta[k];
   if (images?.converted) meta.images = { converted: images.converted + (g.meta.images?.converted || 0), savedBytes: images.savedBytes + (g.meta.images?.savedBytes || 0) };
@@ -255,6 +255,7 @@ export async function importGame(lib, source, opts = {}) {
       transcode,
       ...(images ? { images } : {}),
       hidden: prev?.meta?.hidden || false,
+      ...(prev?.meta?.gigahack ? { gigahack: true } : {}),
     };
     // Text assets compressed once now, so serving them costs no CPU.
     let preDir = null;
